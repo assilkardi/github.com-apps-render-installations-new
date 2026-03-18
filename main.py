@@ -36,10 +36,6 @@ BOT_BRAND_TAGLINE = "Prospection intelligente • Recherche ciblée • Export p
 BOT_BRAND_ACCENT = "✨"
 BOT_BRAND_SUPPORT = "Interface premium Telegram"
 
-# Image d'accueil (optionnel)
-# Tu peux mettre :
-# - une URL publique directe vers une image
-# - ou un chemin local ex: "assets/banner.jpg"
 BRAND_IMAGE = os.getenv("BRAND_IMAGE", "").strip()
 
 # --------------------------------------------------
@@ -187,7 +183,8 @@ def prospects_intro_text() -> str:
         "• commercial\n"
         "• marketing\n"
         "• recruteur\n"
-        "• data analyst"
+        "• data analyst\n\n"
+        "Tu peux aussi coller une <b>offre d’emploi</b> : le bot essaiera de trouver les profils les plus proches."
     )
 
 
@@ -391,6 +388,50 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"[^a-z0-9\s\-]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+def smart_extract_search_query(job_text: str) -> Dict[str, Any]:
+    text = normalize_text(job_text)
+
+    # 🔥 limiter taille
+    words = text.split()
+    text = " ".join(words[:50])
+
+    job = ""
+    keywords = []
+    city = ""
+
+    # 🎯 JOB DETECTION
+    if any(x in text for x in ["fullstack", "full stack"]):
+        job = "developpeur fullstack"
+    elif any(x in text for x in ["backend"]):
+        job = "developpeur backend"
+    elif any(x in text for x in ["frontend"]):
+        job = "developpeur frontend"
+    elif any(x in text for x in ["data"]):
+        job = "data analyst"
+    elif any(x in text for x in ["devops"]):
+        job = "devops engineer"
+    elif any(x in text for x in ["sales", "commercial"]):
+        job = "sales manager"
+
+    # 🎯 TECH DETECTION
+    tech_map = ["python", "java", "react", "node", "aws", "azure", "kubernetes"]
+    for tech in tech_map:
+        if tech in text:
+            keywords.append(tech)
+
+    # 🎯 VILLE
+    cities = ["paris", "lyon", "lille", "marseille", "toulouse", "nantes"]
+    for c in cities:
+        if c in text:
+            city = c
+            break
+
+    return {
+        "job": job or "developpeur",
+        "keywords": keywords[:3],
+        "city": city
+    }
 
 
 def normalize_keyword(keyword: str) -> str:
@@ -606,51 +647,32 @@ def search_web(query: str, start: int = 0, num: int = 10) -> Dict[str, object]:
     cache_key = make_web_cache_key(query, start, num)
     cached = get_cache_payload(cache_key)
     if cached:
-        logger.info("Résultat servi depuis le cache")
         return cached
 
-    last_error = None
-    providers = [
-        ("serper", search_with_serper),
-        ("serpapi", search_with_serpapi),
-    ]
+    # 🔥 TRY SERPER
+    try:
+        result = search_with_serper(query, start=start, num=num)
+        if result.get("organic_results"):
+            set_cache_payload(cache_key, result)
+            return result
+    except Exception as e:
+        logger.warning("Serper failed: %s", e)
 
-    logger.info("Recherche web query=%s start=%s num=%s", query, start, num)
+    # 🔥 TRY SERPAPI
+    try:
+        result = search_with_serpapi(query, start=start, num=num)
+        if result.get("organic_results"):
+            set_cache_payload(cache_key, result)
+            return result
+    except Exception as e:
+        logger.warning("SerpAPI failed: %s", e)
 
-    for provider_name, provider_func in providers:
-        try:
-            result = provider_func(query, start=start, num=num)
-
-            if has_enough_results(result, minimum=1):
-                logger.info("Provider utilisé avec succès: %s", provider_name)
-                set_cache_payload(cache_key, result)
-                return result
-
-            logger.warning("Provider %s n'a pas retourné assez de résultats", provider_name)
-
-        except requests.HTTPError as e:
-            status_code = getattr(e.response, "status_code", None)
-
-            if status_code == 429:
-                logger.warning(
-                    "Provider %s limité (429 Too Many Requests), on passe au suivant",
-                    provider_name,
-                )
-                last_error = RuntimeError(
-                    f"{provider_name} temporairement saturé (limite atteinte)"
-                )
-                continue
-
-            last_error = e
-            logger.warning("Provider %s indisponible: %s", provider_name, e)
-
-        except Exception as e:
-            last_error = e
-            logger.warning("Provider %s indisponible: %s", provider_name, e)
-
-    raise RuntimeError(
-        "Le service de recherche est temporairement indisponible ou limité. Réessaie dans quelques minutes."
-    )
+    # 🔥 FALLBACK
+    return {
+        "organic_results": [],
+        "has_more": False,
+        "next_start": start + num,
+    }
 # --------------------------------------------------
 # PROSPECTS
 # --------------------------------------------------
@@ -724,12 +746,19 @@ def row_matches_keyword(row: Dict[str, str], keyword: str) -> bool:
 
 def build_prospect_query(keyword: str, custom_filters: Dict[str, str]) -> str:
     keyword = normalize_keyword(keyword)
+    normalized_keyword = normalize_text(keyword)
+
     aliases = get_keyword_aliases(keyword)
 
-    if len(aliases) == 1:
-        keyword_part = f'"{aliases[0]}"'
-    else:
+    # 🔥 si plusieurs mots, on construit une requête plus souple
+    keyword_tokens = [t for t in normalized_keyword.split() if len(t) >= 2]
+
+    if len(aliases) > 1:
         keyword_part = "(" + " OR ".join(f'"{a}"' for a in aliases) + ")"
+    elif len(keyword_tokens) >= 2:
+        keyword_part = " ".join(f'"{t}"' for t in keyword_tokens[:4])
+    else:
+        keyword_part = f'"{aliases[0]}"'
 
     query = (
         f'site:linkedin.com/in {keyword_part} '
@@ -759,6 +788,149 @@ def build_prospect_query(keyword: str, custom_filters: Dict[str, str]) -> str:
         query += f' "{seniorite}"'
 
     return query
+
+def is_job_offer(text: str) -> bool:
+    text = normalize_text(text)
+
+    keywords = [
+        "recherche", "poste", "mission", "profil", "experience",
+        "responsable", "manager", "recrutons", "offre", "job",
+        "role", "position", "cdi", "cdd", "alternance", "stage",
+        "candidat", "entreprise", "client", "competences", "qualification"
+    ]
+
+    return any(k in text for k in keywords)
+
+
+def extract_job_params(job_text: str) -> Dict[str, Any]:
+    text = normalize_text(job_text)
+
+    job_titles: List[str] = []
+    keywords: List[str] = []
+    experience_years = 0
+    words = text.split()
+    text = " ".join(words[:30])
+
+    if any(x in text for x in ["sales", "commercial", "business developer", "bizdev"]):
+        job_titles += ["sales manager", "account executive", "business developer", "commercial"]
+
+    if any(x in text for x in ["marketing", "growth"]):
+        job_titles += ["marketing manager", "growth manager"]
+
+    if any(x in text for x in ["data", "bi"]):
+        job_titles += ["data analyst", "data scientist"]
+
+    if "saas" in text:
+        keywords.append("saas")
+
+    if "b2b" in text:
+        keywords.append("b2b")
+
+    # 🔥 EXPERIENCE
+    exp_match = re.search(r"(\d+)\s*(ans|years)", text)
+    if exp_match:
+        experience_years = int(exp_match.group(1))
+
+    city_match = re.search(r"(paris|lyon|marseille|lille)", text)
+    city = city_match.group(1) if city_match else ""
+
+    if not job_titles:
+        job_titles = [job_text]
+
+    return {
+        "job_titles": job_titles,
+        "keywords": keywords,
+        "city": city,
+        "experience": experience_years,  # 🔥 NEW
+    }
+
+
+def build_multi_queries(params: Dict[str, Any]) -> List[str]:
+    queries = []
+
+    for title in params.get("job_titles", []):
+        parts = [title]
+        parts.extend(params.get("keywords", []))
+        if params.get("city"):
+            parts.append(params["city"])
+        base = clean_spaces(" ".join(parts))
+        if base:
+            queries.append(base)
+
+    if not queries and params.get("job_titles"):
+        queries = params["job_titles"][:]
+
+    return list(dict.fromkeys(queries))
+
+def extract_experience_from_text(text: str) -> int:
+    match = re.search(r"(\d+)\s*(ans|years)", text.lower())
+    return int(match.group(1)) if match else 0
+
+def row_matches_job_offer(row: Dict[str, str], params: Dict[str, Any]) -> bool:
+    text = normalize_text(" ".join([
+        row.get("Poste", ""),
+        row.get("Entreprise", ""),
+        row.get("Snippet", ""),
+    ]))
+
+    title_hit = False
+    for t in params.get("job_titles", []):
+        nt = normalize_text(t)
+        if nt and nt in text:
+            title_hit = True
+            break
+
+    keyword_hits = 0
+    for k in params.get("keywords", []):
+        nk = normalize_text(k)
+        if nk and nk in text:
+            keyword_hits += 1
+
+    if title_hit:
+        return True
+    if keyword_hits >= 1:
+        return True
+
+    return False
+
+
+def score_profile_advanced(row: Dict[str, str], params: Dict[str, Any], custom_filters: Dict[str, str]) -> int:
+    score = 0
+
+    title = normalize_text(row.get("Poste", ""))
+    snippet = normalize_text(row.get("Snippet", ""))
+    combined = f"{title} {snippet}"
+
+    # 🎯 TITRE
+    for t in params.get("job_titles", []):
+        nt = normalize_text(t)
+        if nt in title:
+            score += 50
+            break
+        elif nt in combined:
+            score += 25
+
+    # 🎯 KEYWORDS
+    for k in params.get("keywords", []):
+        nk = normalize_text(k)
+        if nk in combined:
+            score += 15
+
+    # 🎯 VILLE
+    if params.get("city") and params["city"] in combined:
+        score += 20
+
+    # 🔥 EXPERIENCE
+    required_exp = params.get("experience", 0)
+    profile_exp = extract_experience_from_text(snippet)
+
+    if required_exp:
+        if profile_exp >= required_exp:
+            score += 25
+        else:
+            score -= 10
+
+    return score
 
 # --------------------------------------------------
 # RECHERCHE PERSONNE LINKEDIN
@@ -980,7 +1152,7 @@ def compute_company_info_score(row: Dict[str, str]) -> int:
 def compute_company_relevance(row: Dict[str, str], target_name: str, ville_filter: str = "") -> Tuple[int, int]:
     parts = split_name(target_name)
     full_name = " ".join(parts).strip()
-    last_name = parts[-1] if parts else name.strip() if (name := target_name) else ""
+    last_name = parts[-1] if parts else target_name.strip()
 
     searchable_text = " ".join([
         row.get("Entreprise_INPI", "") or "",
@@ -1606,62 +1778,136 @@ def search_prospect_page(
     start: int = 0,
     page_size: int = SERP_BATCH_SIZE,
 ) -> Dict[str, object]:
+
     custom_filters = custom_filters or {}
-    cache_key = make_cache_key("prospect", keyword, custom_filters, start, page_size, False)
 
-    cached = get_cache_payload(cache_key)
-    if cached:
-        return cached
+    if len(keyword) > 300:
+        keyword = keyword[:300]
 
-    query = build_prospect_query(keyword, custom_filters)
-    page = google_search_page(query, custom_filters, start, page_size)
-    organic_results = page["organic_results"]
+    raw_keyword = clean_spaces(keyword)
+    normalized_keyword = normalize_text(raw_keyword)
 
-    results: List[Dict[str, str]] = []
-    seen_links = set()
+    # 🔥 mode offre
+    if is_job_offer(raw_keyword):
+        smart = smart_extract_search_query(raw_keyword)
+        base_query = smart["job"]
 
-    for item in organic_results:
-        link = normalize_linkedin_url(item.get("link", ""))
-        if not link or "linkedin.com/in/" not in link:
-            continue
-        if link in seen_links:
-            continue
-        seen_links.add(link)
+        if smart["keywords"]:
+            base_query += " " + " ".join(smart["keywords"])
+        if smart["city"]:
+            base_query += f" {smart['city']}"
 
-        title_data = parse_google_title(item.get("title", ""))
-        snippet = (item.get("snippet", "") or "").strip()
+        queries = [base_query]
 
-        row = {
-            "Nom": title_data.get("Nom", ""),
-            "Poste": title_data.get("Poste", ""),
-            "Entreprise": title_data.get("Entreprise", ""),
-            "Ville": custom_filters.get("ville", ""),
-            "Pays": custom_filters.get("pays", ""),
-            "Source": "Google / LinkedIn",
-            "Statut": "À contacter",
-            "Priorité": "Moyenne",
-            "Notes": "",
-            "Snippet": snippet,
-            "LinkedIn": link,
+        # variantes bonus pour mieux matcher
+        if smart["keywords"]:
+            queries.append(f"{smart['job']} {' '.join(smart['keywords'])}")
+        if smart["city"]:
+            queries.append(f"{smart['job']} {smart['city']}")
+
+        params = {
+            "job_titles": [smart["job"]],
+            "keywords": smart["keywords"],
+            "city": smart["city"],
+            "experience": extract_job_params(raw_keyword).get("experience", 0),
         }
 
-        if not row_matches_keyword(row, keyword):
-            continue
+    else:
+        # 🔥 mode mots-clés libres
+        tokens = [t for t in normalized_keyword.split() if len(t) >= 2]
 
-        results.append(row)
+        queries = [raw_keyword]
 
-        if start + len(results) >= MAX_RESULTS:
-            break
+        # ex: "programmeur fullstack react"
+        if len(tokens) >= 2:
+            queries.append(" ".join(tokens[:2]))
+        if len(tokens) >= 3:
+            queries.append(" ".join(tokens[:3]))
 
-    payload = {
-        "results": results,
-        "next_start": page["next_start"],
-        "has_more": bool(page["has_more"]) and (start + len(results) < MAX_RESULTS),
+        # variantes ciblées si on détecte une techno / métier
+        smart = smart_extract_search_query(raw_keyword)
+        smart_query = smart["job"]
+        if smart["keywords"]:
+            smart_query += " " + " ".join(smart["keywords"])
+        if smart["city"]:
+            smart_query += f" {smart['city']}"
+
+        if smart_query and normalize_text(smart_query) != normalized_keyword:
+            queries.append(smart_query)
+
+        queries = list(dict.fromkeys([q for q in queries if clean_spaces(q)]))
+
+        params = {
+            "job_titles": [smart.get("job") or raw_keyword],
+            "keywords": smart.get("keywords", []),
+            "city": smart.get("city", ""),
+            "experience": 0,
+        }
+
+    all_results: List[Dict[str, str]] = []
+    seen_links = set()
+
+    for q in queries[:5]:
+        query = build_prospect_query(q, custom_filters)
+        page = google_search_page(query, custom_filters, start, page_size)
+        organic_results = page["organic_results"]
+
+        for item in organic_results:
+            link = normalize_linkedin_url(item.get("link", ""))
+
+            if not link or "linkedin.com/in/" not in link:
+                continue
+            if link in seen_links:
+                continue
+
+            seen_links.add(link)
+
+            title_data = parse_google_title(item.get("title", ""))
+            snippet = (item.get("snippet", "") or "").strip()
+
+            row = {
+                "Nom": title_data.get("Nom", ""),
+                "Poste": title_data.get("Poste", ""),
+                "Entreprise": title_data.get("Entreprise", ""),
+                "Ville": custom_filters.get("ville", ""),
+                "Pays": custom_filters.get("pays", ""),
+                "Source": "Google / LinkedIn",
+                "Statut": "À contacter",
+                "Priorité": "Moyenne",
+                "Notes": "",
+                "Snippet": snippet,
+                "LinkedIn": link,
+            }
+
+            # 🔥 filtrage intelligent
+            if is_job_offer(raw_keyword):
+                if not row_matches_job_offer(row, params):
+                    continue
+            else:
+                # on accepte soit le match alias classique,
+                # soit un match sur les tokens du texte
+                token_match = False
+                for token in [t for t in normalized_keyword.split() if len(t) >= 3]:
+                    haystack = normalize_text(
+                        f"{row.get('Poste', '')} {row.get('Entreprise', '')} {row.get('Snippet', '')}"
+                    )
+                    if token in haystack:
+                        token_match = True
+                        break
+
+                if not row_matches_keyword(row, raw_keyword) and not token_match:
+                    continue
+
+            row["MatchScore"] = score_profile_advanced(row, params, custom_filters)
+            all_results.append(row)
+
+    all_results.sort(key=lambda x: x.get("MatchScore", 0), reverse=True)
+
+    return {
+        "results": all_results[:page_size],
+        "next_start": start + page_size,
+        "has_more": len(all_results) > page_size,
     }
-
-    set_cache_payload(cache_key, payload)
-    return payload
-
 # --------------------------------------------------
 # RECHERCHE PERSONNE LINKEDIN
 # --------------------------------------------------

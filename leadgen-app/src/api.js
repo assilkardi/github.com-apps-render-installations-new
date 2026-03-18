@@ -1,6 +1,6 @@
 const API_BASE_URL = import.meta.env.DEV
   ? "http://127.0.0.1:8000"
-  : "https://TON-API-RENDER.onrender.com";
+  : "https://leadgen-api-8d37.onrender.com";
 
 export const APP_API_BASE_URL = API_BASE_URL;
 
@@ -13,9 +13,11 @@ export async function runSearch(payload) {
     body: JSON.stringify(payload),
   });
 
+  const data = await response.json();
+
   if (!response.ok) {
-    throw new Error("Erreur API");
+    throw new Error(data?.message || "Erreur API");
   }
 
-  return response.json();
-} 
+  return data;
+}
