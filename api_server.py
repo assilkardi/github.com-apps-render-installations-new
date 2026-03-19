@@ -1,22 +1,29 @@
+from typing import Any, Dict, List, Literal, Optional
+import asyncio
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional, Literal, Any
-import asyncio
-import os
-
 from main import (
-    search_full_export,
-    search_company_person,
+    ACCESS_STATE,
+    PROVIDER_STATS,
+    SEARCH_CACHE,
     export_excel,
+    provider_cooldown_remaining,
+    search_company_person,
+    search_full_export,
 )
 
 app = FastAPI(title="LeadGen Premium API")
 
+raw_origins = os.getenv("API_ALLOW_ORIGINS", "*").strip()
+allow_origins = ["*"] if raw_origins == "*" else [o.strip() for o in raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,15 +31,17 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPORT_DIR = os.path.join(BASE_DIR, "exports")
+MAX_API_RESULTS = 200
+MAX_QUERY_LENGTH = 300
 
 
 class SearchRequest(BaseModel):
     mode: Literal["prospect", "person", "company"]
-    query: str = Field(..., min_length=1)
+    query: str = Field(..., min_length=1, max_length=MAX_QUERY_LENGTH)
     filters: Optional[Dict[str, str]] = None
     fuzzy_enabled: bool = False
     export_excel_requested: bool = False
-    max_results: int = 20
+    max_results: int = Field(default=20, ge=1, le=MAX_API_RESULTS)
 
 
 class SearchResponse(BaseModel):
@@ -46,7 +55,17 @@ class SearchResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "LeadGen Premium API"}
+    return {
+        "ok": True,
+        "service": "LeadGen Premium API",
+        "cache_entries": len(SEARCH_CACHE) if isinstance(SEARCH_CACHE, dict) else 0,
+        "approved_users": len(ACCESS_STATE.get("approved_users", {})),
+        "pending_users": len(ACCESS_STATE.get("pending_users", {})),
+        "blacklist": len(ACCESS_STATE.get("blacklist", {})),
+        "provider_stats": PROVIDER_STATS,
+        "serpapi_cooldown_seconds": provider_cooldown_remaining("serpapi"),
+        "cors": allow_origins,
+    }
 
 
 @app.get("/download/{filename}")
@@ -68,7 +87,7 @@ def download_file(filename: str):
 async def search_endpoint(payload: SearchRequest):
     mode = payload.mode
     query = payload.query.strip()
-    filters = payload.filters or {}
+    filters = {k: str(v) for k, v in (payload.filters or {}).items() if str(v).strip()}
 
     try:
         if mode == "company":
@@ -114,7 +133,6 @@ async def search_endpoint(payload: SearchRequest):
 
     except Exception as e:
         error_message = str(e)
-
         if "429" in error_message or "Too Many Requests" in error_message:
             error_message = "Le service de recherche est temporairement saturé. Réessaie dans quelques minutes."
 
