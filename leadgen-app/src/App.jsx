@@ -511,7 +511,7 @@ export default function App() {
                           {card.Entreprise_INPI || card.Entreprise || card.raison_sociale || "Entreprise non renseignée"}
                         </div>
                         <div className="result-meta">
-                          SIREN : {card.SIREN || card.siren || "Non renseigné"}
+                          {card.Forme_juridique || card.forme_juridique || "Informations société"}
                         </div>
                       </div>
 
