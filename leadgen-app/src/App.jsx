@@ -622,13 +622,13 @@ export default function App() {
                     bottom: "10px",
                     right: "15px",
                     fontSize: "12px",
-                    opacity: 0.15,
+                    opacity: 1,
                     cursor: "pointer",
                     zIndex: 9999,
                   }} onMouseEnter={(e) => (e.target.style.opacity = 0.6)}
-                   onMouseLeave={(e) => (e.target.style.opacity = 0.15)}
+                   onMouseLeave={(e) => (e.target.style.opacity = 1)}
                 >
-                  ⚙️
+                  ADMIN
                 </div>
 
                 <div className="button-row">
