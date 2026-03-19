@@ -4222,3 +4222,20 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
+# -----------------------
+# PROVIDER COOLDOWN (FIX)
+# -----------------------
+
+_PROVIDER_COOLDOWNS = {}
+
+def provider_cooldown_remaining(provider: str) -> float:
+    import time
+    now = time.time()
+    if provider not in _PROVIDER_COOLDOWNS:
+        return 0.0
+    remaining = _PROVIDER_COOLDOWNS[provider] - now
+    return max(0.0, remaining)
+
+def set_provider_cooldown(provider: str, seconds: int):
+    import time
+    _PROVIDER_COOLDOWNS[provider] = time.time() + seconds
