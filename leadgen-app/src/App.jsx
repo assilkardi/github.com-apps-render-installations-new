@@ -615,22 +615,6 @@ export default function App() {
                 </div>
 
                 {adminError && <div className="note-card">{adminError}</div>}
-                <div
-                  onClick={openAdminLogin}
-                  style={{
-                    position: "fixed",
-                    bottom: "10px",
-                    right: "15px",
-                    fontSize: "12px",
-                    opacity: 1,
-                    cursor: "pointer",
-                    zIndex: 9999,
-                  }} onMouseEnter={(e) => (e.target.style.opacity = 0.6)}
-                   onMouseLeave={(e) => (e.target.style.opacity = 1)}
-                >
-                  ADMIN
-                </div>
-
                 <div className="button-row">
                   <button className="btn btn-light" onClick={handleAdminLogin}>
                     Ouvrir le dashboard
@@ -643,6 +627,20 @@ export default function App() {
             </div>
           </div>
         )}
+      </div>
+      <div
+        onClick={openAdminLogin}
+        style={{
+          position: "fixed",
+          bottom: "10px",
+          right: "15px",
+          fontSize: "12px",
+          opacity: 0.2,
+          cursor: "pointer",
+          zIndex: 999999,
+        }}
+      >
+        ⚙️
       </div>
     </div>
   );
