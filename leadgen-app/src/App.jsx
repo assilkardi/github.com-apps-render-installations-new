@@ -505,67 +505,50 @@ export default function App() {
                     <div className="result-top">
                       <div>
                         <div className="result-name">
-                          {card.Dirigeant || card.nom_complet || "Dirigeant non renseigné"}
+                          {card.Dirigeant || "Dirigeant non renseigné"}
                         </div>
+
                         <div className="result-role">
-                          {card.Entreprise_INPI || card.Entreprise || card.raison_sociale || "Entreprise non renseignée"}
+                          {card.Entreprise_INPI || "Entreprise non renseignée"}
                         </div>
+
                         <div className="result-meta">
-                          {card.Forme_juridique || card.forme_juridique || "Informations société"}
+                          {card.Adresse_INPI || "Adresse non renseignée"}
                         </div>
+
+                        <div className="result-meta">
+                          {card.Ville_INPI || "Ville non renseignée"}
+                        </div>
+
+                        {card.Activite && (
+                          <div className="result-meta">
+                            Activité : {card.Activite}
+                          </div>
+                        )}
+
+                        {card.Date_creation && (
+                          <div className="result-meta">
+                            Création : {card.Date_creation}
+                          </div>
+                        )}
                       </div>
 
                       <div className="result-tags">
-                        {(card.SIREN || card.siren) && (
-                          <span className="success-pill">
-                            SIREN {card.SIREN || card.siren}
+                        {card.RelevanceLabel && (
+                          <span className="score-pill">
+                            {card.RelevanceLabel}
                           </span>
                         )}
                       </div>
                     </div>
 
-                    <div className="company-details">
-                      {(card.Adresse || card.adresse) && (
-                        <div className="company-line">
-                          <strong>Adresse :</strong> {card.Adresse || card.adresse}
-                        </div>
-                      )}
-
-                      {(card.Code_postal || card.code_postal || card.code_postal_etablissement) && (
-                        <div className="company-line">
-                          <strong>Code postal :</strong>{" "}
-                          {card.Code_postal || card.code_postal || card.code_postal_etablissement}
-                        </div>
-                      )}
-
-                      {(card.Ville || card.ville || card.libelle_commune) && (
-                        <div className="company-line">
-                          <strong>Ville :</strong> {card.Ville || card.ville || card.libelle_commune}
-                        </div>
-                      )}
-
-                      {(card.Forme_juridique || card.forme_juridique) && (
-                        <div className="company-line">
-                          <strong>Forme juridique :</strong>{" "}
-                          {card.Forme_juridique || card.forme_juridique}
-                        </div>
-                      )}
-
-                      {(card.Activite || card.activite || card.code_naf) && (
-                        <div className="company-line">
-                          <strong>Activité :</strong>{" "}
-                          {card.Activite || card.activite || card.code_naf}
-                        </div>
-                      )}
-
-                      {(card.Source || card.source) && (
-                        <div className="company-line">
-                          <strong>Source :</strong> {card.Source || card.source}
-                        </div>
-                      )}
-                    </div>
-
                     <div className="button-row wrap">
+                      {card.SIREN && (
+                        <span className="success-pill">
+                          SIREN {card.SIREN}
+                        </span>
+                      )}
+
                       {card.Lien_source ? (
                         <a
                           className="btn btn-outline small-btn"

@@ -16,6 +16,7 @@ from main import (
     search_full_export,
 )
 
+
 app = FastAPI(title="LeadGen Premium API")
 
 raw_origins = os.getenv("API_ALLOW_ORIGINS", "*").strip()
@@ -52,6 +53,44 @@ class SearchResponse(BaseModel):
     results: List[Dict[str, Any]]
     excel_file: Optional[str] = None
     message: Optional[str] = None
+    
+# --------------------------------------------------
+# COMPANY RESULT NORMALIZATION + SCORING
+# --------------------------------------------------
+
+def normalize_company_result(item):
+    return {
+        "Dirigeant": item.get("Dirigeant") or item.get("nom_complet") or item.get("dirigeant") or "",
+        "Entreprise_INPI": item.get("Entreprise_INPI") or item.get("Entreprise") or item.get("raison_sociale") or "",
+        "SIREN": item.get("SIREN") or item.get("siren") or "",
+        "Adresse_INPI": item.get("Adresse_INPI") or item.get("Adresse") or item.get("adresse") or item.get("adresse_complete") or "",
+        "Ville_INPI": item.get("Ville_INPI") or item.get("Ville") or item.get("ville") or item.get("libelle_commune") or "",
+        "Activite": item.get("Activite") or item.get("activite") or item.get("code_naf") or "",
+        "Date_creation": item.get("Date_creation") or item.get("date_creation") or "",
+        "Lien_source": item.get("Lien_source") or item.get("source_url") or item.get("lien_source") or "",
+        "Source": item.get("Source") or item.get("source") or "",
+    }
+
+
+def company_result_score(item):
+    score = 0
+
+    if item.get("Dirigeant"):
+        score += 50
+    if item.get("Entreprise_INPI"):
+        score += 40
+    if item.get("Adresse_INPI"):
+        score += 30
+    if item.get("Ville_INPI"):
+        score += 20
+    if item.get("Lien_source"):
+        score += 20
+    if item.get("Activite"):
+        score += 10
+    if item.get("Date_creation"):
+        score += 5
+
+    return score
 
 
 def check_admin_token(x_admin_token: Optional[str]) -> None:
@@ -118,19 +157,6 @@ def download_file(filename: str):
         filename=safe_name,
     )
 
-def normalize_company_result(item: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "Dirigeant": item.get("Dirigeant") or item.get("nom_complet") or item.get("dirigeant") or "",
-        "Entreprise_INPI": item.get("Entreprise_INPI") or item.get("Entreprise") or item.get("raison_sociale") or "",
-        "SIREN": item.get("SIREN") or item.get("siren") or "",
-        "Adresse": item.get("Adresse") or item.get("adresse") or item.get("adresse_complete") or item.get("siege_adresse") or "",
-        "Code_postal": item.get("Code_postal") or item.get("code_postal") or item.get("code_postal_etablissement") or "",
-        "Ville": item.get("Ville") or item.get("ville") or item.get("libelle_commune") or item.get("commune") or "",
-        "Forme_juridique": item.get("Forme_juridique") or item.get("forme_juridique") or "",
-        "Activite": item.get("Activite") or item.get("activite") or item.get("code_naf") or item.get("libelle_naf") or "",
-        "Lien_source": item.get("Lien_source") or item.get("lien_source") or item.get("source_url") or "",
-        "Source": item.get("Source") or item.get("source") or "",
-    }
 
 @app.post("/search", response_model=SearchResponse)
 async def search_endpoint(payload: SearchRequest):
@@ -143,6 +169,26 @@ async def search_endpoint(payload: SearchRequest):
             ville_filter = filters.get("ville", "")
             results = await asyncio.to_thread(search_company_person, query, ville_filter)
             results = [normalize_company_result(r) for r in results]
+            seen = set()
+            deduped = []
+            for r in results:
+                key = (
+                r.get("Dirigeant", "").strip().lower(),
+                r.get("Entreprise_INPI", "").strip().lower(),
+                r.get("SIREN", "").strip().lower(),
+        )
+            if key not in seen:
+                seen.add(key)
+                deduped.append(r)
+            results = sorted(
+            deduped,
+            key=lambda x: (
+                company_result_score(x),
+                x.get("Dirigeant", "").strip().lower(),
+                x.get("Entreprise_INPI", "").strip().lower(),
+            ),
+            reverse=True,
+        )
 
             print("DEBUG COMPANY RESULTS =", results[:3])
             
