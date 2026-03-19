@@ -129,7 +129,9 @@ async def search_endpoint(payload: SearchRequest):
         if mode == "company":
             ville_filter = filters.get("ville", "")
             results = await asyncio.to_thread(search_company_person, query, ville_filter)
-
+            
+            print("DEBUG COMPANY RESULTS =", results[:3])
+            
             excel_file = None
             if payload.export_excel_requested and results:
                 file_path = await asyncio.to_thread(export_excel, results, query)
