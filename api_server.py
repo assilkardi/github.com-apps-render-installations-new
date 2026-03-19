@@ -118,6 +118,19 @@ def download_file(filename: str):
         filename=safe_name,
     )
 
+def normalize_company_result(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "Dirigeant": item.get("Dirigeant") or item.get("nom_complet") or item.get("dirigeant") or "",
+        "Entreprise_INPI": item.get("Entreprise_INPI") or item.get("Entreprise") or item.get("raison_sociale") or "",
+        "SIREN": item.get("SIREN") or item.get("siren") or "",
+        "Adresse": item.get("Adresse") or item.get("adresse") or item.get("adresse_complete") or item.get("siege_adresse") or "",
+        "Code_postal": item.get("Code_postal") or item.get("code_postal") or item.get("code_postal_etablissement") or "",
+        "Ville": item.get("Ville") or item.get("ville") or item.get("libelle_commune") or item.get("commune") or "",
+        "Forme_juridique": item.get("Forme_juridique") or item.get("forme_juridique") or "",
+        "Activite": item.get("Activite") or item.get("activite") or item.get("code_naf") or item.get("libelle_naf") or "",
+        "Lien_source": item.get("Lien_source") or item.get("lien_source") or item.get("source_url") or "",
+        "Source": item.get("Source") or item.get("source") or "",
+    }
 
 @app.post("/search", response_model=SearchResponse)
 async def search_endpoint(payload: SearchRequest):
@@ -129,7 +142,8 @@ async def search_endpoint(payload: SearchRequest):
         if mode == "company":
             ville_filter = filters.get("ville", "")
             results = await asyncio.to_thread(search_company_person, query, ville_filter)
-            
+            results = [normalize_company_result(r) for r in results]
+
             print("DEBUG COMPANY RESULTS =", results[:3])
             
             excel_file = None
