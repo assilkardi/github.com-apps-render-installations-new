@@ -27,4 +27,6 @@ __pycache__/
 .DS_Store
 exports/
 search_cache.json
-node_modules/
+node_modules/venv/
+__pycache__/
+*.pyc
