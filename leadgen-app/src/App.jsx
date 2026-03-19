@@ -635,10 +635,13 @@ export default function App() {
           bottom: "10px",
           right: "15px",
           fontSize: "12px",
-          opacity: 0.2,
+          opacity: 0.15,
           cursor: "pointer",
-          zIndex: 999999,
+          zIndex: 9999,
+          transition: "0.3s",
         }}
+        onMouseEnter={(e) => (e.target.style.opacity = 0.6)}
+        onMouseLeave={(e) => (e.target.style.opacity = 0.15)}
       >
         ⚙️
       </div>
