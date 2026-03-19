@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Literal, Optional
 import asyncio
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -33,6 +33,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 MAX_API_RESULTS = 200
 MAX_QUERY_LENGTH = 300
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
 
 class SearchRequest(BaseModel):
@@ -53,6 +54,22 @@ class SearchResponse(BaseModel):
     message: Optional[str] = None
 
 
+def check_admin_token(x_admin_token: Optional[str]) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN non configuré côté serveur.")
+
+    if not x_admin_token or x_admin_token.strip() != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Accès admin refusé.")
+
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "message": "LeadGen Premium API opérationnelle."
+    }
+
+
 @app.get("/health")
 def health():
     return {
@@ -64,6 +81,25 @@ def health():
         "blacklist": len(ACCESS_STATE.get("blacklist", {})),
         "provider_stats": PROVIDER_STATS,
         "serpapi_cooldown_seconds": provider_cooldown_remaining("serpapi"),
+        "serper_cooldown_seconds": provider_cooldown_remaining("serper"),
+        "cors": allow_origins,
+    }
+
+
+@app.get("/admin/stats")
+def admin_stats(x_admin_token: Optional[str] = Header(default=None)):
+    check_admin_token(x_admin_token)
+
+    return {
+        "ok": True,
+        "service": "LeadGen Premium API",
+        "cache_entries": len(SEARCH_CACHE) if isinstance(SEARCH_CACHE, dict) else 0,
+        "approved_users": len(ACCESS_STATE.get("approved_users", {})),
+        "pending_users": len(ACCESS_STATE.get("pending_users", {})),
+        "blacklist": len(ACCESS_STATE.get("blacklist", {})),
+        "provider_stats": PROVIDER_STATS,
+        "serpapi_cooldown_seconds": provider_cooldown_remaining("serpapi"),
+        "serper_cooldown_seconds": provider_cooldown_remaining("serper"),
         "cors": allow_origins,
     }
 

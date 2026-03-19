@@ -21,3 +21,21 @@ export async function runSearch(payload) {
 
   return data;
 }
+
+export async function getAdminStats(adminToken) {
+  const response = await fetch(`${API_BASE_URL}/admin/stats`, {
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Admin-Token": adminToken,
+    },
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data?.detail || "Accès admin refusé.");
+  }
+
+  return data;
+}

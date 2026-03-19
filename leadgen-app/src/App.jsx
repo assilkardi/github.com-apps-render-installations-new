@@ -7,7 +7,6 @@ const INITIAL_LIMIT = 10;
 const LOAD_MORE_STEP = 10;
 
 export default function App() {
-  const [view, setView] = useState("search");
   const [mode, setMode] = useState("prospect");
 
   const [query, setQuery] = useState("");
@@ -28,6 +27,12 @@ export default function App() {
   const [excelFile, setExcelFile] = useState("");
   const [requestedLimit, setRequestedLimit] = useState(INITIAL_LIMIT);
   const [hasSearched, setHasSearched] = useState(false);
+
+  const [showAdminLogin, setShowAdminLogin] = useState(false);
+  const [adminAuthenticated, setAdminAuthenticated] = useState(false);
+  const [adminToken, setAdminToken] = useState("");
+  const [adminDraftToken, setAdminDraftToken] = useState("");
+  const [adminError, setAdminError] = useState("");
 
   const modules = [
     {
@@ -186,55 +191,45 @@ export default function App() {
     setLoadingMore(false);
   }
 
+  function openAdminLogin() {
+    setShowAdminLogin(true);
+    setAdminError("");
+  }
+
+  function closeAdminLogin() {
+    setShowAdminLogin(false);
+    setAdminDraftToken("");
+    setAdminError("");
+  }
+
+  function handleAdminLogin() {
+    if (!adminDraftToken.trim()) {
+      setAdminError("Merci de saisir le token admin.");
+      return;
+    }
+
+    setAdminToken(adminDraftToken.trim());
+    setAdminAuthenticated(true);
+    setShowAdminLogin(false);
+    setAdminError("");
+  }
+
+  function handleAdminLogout() {
+    setAdminAuthenticated(false);
+    setAdminToken("");
+    setAdminDraftToken("");
+    setAdminError("");
+  }
+
   const canLoadMore = results.length >= requestedLimit && results.length > 0;
 
-  if (view === "admin") {
+  if (adminAuthenticated) {
     return (
-      <div className="app-shell">
-        <div className="app-container">
-          <header className="hero-card">
-            <div className="hero-grid">
-              <div>
-                <div className="badge">🛠️ Admin</div>
-                <h1 className="hero-title">LeadGen Admin Dashboard</h1>
-                <p className="hero-text">
-                  Vue d’administration pour surveiller l’état du moteur, les
-                  providers, le cache et les accès.
-                </p>
-              </div>
-
-              <div className="side-panel">
-                <div className="side-head">
-                  <div>
-                    <div className="side-label">Espace</div>
-                    <div className="side-user">LeadGen • Admin</div>
-                  </div>
-                  <div className="online-pill">Actif</div>
-                </div>
-
-                <div className="button-stack">
-                  <button
-                    className="btn btn-light"
-                    onClick={() => setView("search")}
-                  >
-                    Retour à la recherche
-                  </button>
-                </div>
-
-                <div className="note-card">
-                  <div className="stat-label">Mode</div>
-                  <div className="note-text">
-                    Tu gardes toute l’interface client actuelle, et tu ajoutes
-                    juste une vue admin séparée.
-                  </div>
-                </div>
-              </div>
-            </div>
-          </header>
-
-          <AdminDashboard onBack={() => setView("search")} />
-        </div>
-      </div>
+      <AdminDashboard
+        adminToken={adminToken}
+        onBack={() => setAdminAuthenticated(false)}
+        onLogout={handleAdminLogout}
+      />
     );
   }
 
@@ -284,10 +279,7 @@ export default function App() {
                 <button className="btn btn-outline" onClick={handleReset}>
                   Réinitialiser
                 </button>
-                <button
-                  className="btn btn-outline"
-                  onClick={() => setView("admin")}
-                >
+                <button className="btn btn-outline" onClick={openAdminLogin}>
                   Dashboard admin
                 </button>
               </div>
@@ -298,16 +290,6 @@ export default function App() {
                   Outil de prospection premium pensé comme un mini CRM visuel
                   directement dans Telegram.
                 </div>
-              </div>
-
-              <div className="premium-card">
-                <div className="premium-pill">Premium</div>
-                <h3 className="premium-title">Version Pro</h3>
-                <p className="premium-text">
-                  Interface premium pensée pour une prospection rapide, élégante
-                  et prête à être monétisée.
-                </p>
-                <button className="btn btn-gold">Upgrade</button>
               </div>
             </div>
           </div>
@@ -594,6 +576,62 @@ export default function App() {
             )}
           </div>
         </section>
+
+        {showAdminLogin && (
+          <div
+            style={{
+              position: "fixed",
+              inset: 0,
+              background: "rgba(0,0,0,0.55)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "20px",
+              zIndex: 9999,
+            }}
+          >
+            <div
+              className="panel-card"
+              style={{
+                width: "100%",
+                maxWidth: "460px",
+              }}
+            >
+              <div className="panel-head">
+                <div>
+                  <h3 className="panel-title">Connexion admin</h3>
+                  <p className="panel-subtitle">
+                    Saisis le token admin configuré côté backend.
+                  </p>
+                </div>
+              </div>
+
+              <div className="form-grid">
+                <div>
+                  <label className="input-label">Token admin</label>
+                  <input
+                    className="text-input"
+                    type="password"
+                    placeholder="Entrer le token admin"
+                    value={adminDraftToken}
+                    onChange={(e) => setAdminDraftToken(e.target.value)}
+                  />
+                </div>
+
+                {adminError && <div className="note-card">{adminError}</div>}
+
+                <div className="button-row">
+                  <button className="btn btn-light" onClick={handleAdminLogin}>
+                    Ouvrir le dashboard
+                  </button>
+                  <button className="btn btn-outline" onClick={closeAdminLogin}>
+                    Annuler
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
