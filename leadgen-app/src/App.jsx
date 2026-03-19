@@ -76,7 +76,7 @@ export default function App() {
           formSubtitle:
             "Saisis un nom, un patronyme ou une société pour retrouver dirigeant, entreprise et SIREN.",
           mainLabel: "Nom / entreprise / dirigeant",
-          mainPlaceholder: "Ex. Dupont, Belkhiri, Martin Conseil",
+          mainPlaceholder: "Ex. Dupont, Jerome BENHAMOU, Martin & Co",
           buttonLabel: "Rechercher l’entreprise",
           resultTitle: "Entreprises trouvées",
           emptyText: "Aucun résultat entreprise affiché pour le moment.",

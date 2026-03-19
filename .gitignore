@@ -17,4 +17,4 @@ leadgen-app/.vercel/
 __MACOSX/
 
 # Git / local
-.git/
+.git/venv 03-48-40-994/
