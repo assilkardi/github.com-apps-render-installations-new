@@ -1,11 +1,13 @@
 import { useMemo, useState } from "react";
 import "./App.css";
 import { APP_API_BASE_URL, runSearch } from "./api";
+import AdminDashboard from "./AdminDashboard";
 
 const INITIAL_LIMIT = 10;
 const LOAD_MORE_STEP = 10;
 
 export default function App() {
+  const [view, setView] = useState("search");
   const [mode, setMode] = useState("prospect");
 
   const [query, setQuery] = useState("");
@@ -186,6 +188,56 @@ export default function App() {
 
   const canLoadMore = results.length >= requestedLimit && results.length > 0;
 
+  if (view === "admin") {
+    return (
+      <div className="app-shell">
+        <div className="app-container">
+          <header className="hero-card">
+            <div className="hero-grid">
+              <div>
+                <div className="badge">🛠️ Admin</div>
+                <h1 className="hero-title">LeadGen Admin Dashboard</h1>
+                <p className="hero-text">
+                  Vue d’administration pour surveiller l’état du moteur, les
+                  providers, le cache et les accès.
+                </p>
+              </div>
+
+              <div className="side-panel">
+                <div className="side-head">
+                  <div>
+                    <div className="side-label">Espace</div>
+                    <div className="side-user">LeadGen • Admin</div>
+                  </div>
+                  <div className="online-pill">Actif</div>
+                </div>
+
+                <div className="button-stack">
+                  <button
+                    className="btn btn-light"
+                    onClick={() => setView("search")}
+                  >
+                    Retour à la recherche
+                  </button>
+                </div>
+
+                <div className="note-card">
+                  <div className="stat-label">Mode</div>
+                  <div className="note-text">
+                    Tu gardes toute l’interface client actuelle, et tu ajoutes
+                    juste une vue admin séparée.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </header>
+
+          <AdminDashboard onBack={() => setView("search")} />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <div className="app-container">
@@ -231,6 +283,12 @@ export default function App() {
                 </button>
                 <button className="btn btn-outline" onClick={handleReset}>
                   Réinitialiser
+                </button>
+                <button
+                  className="btn btn-outline"
+                  onClick={() => setView("admin")}
+                >
+                  Dashboard admin
                 </button>
               </div>
 
