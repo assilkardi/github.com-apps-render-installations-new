@@ -66,30 +66,30 @@ export default function App() {
   const modeConfig =
     mode === "prospect"
       ? {
-          formTitle: "Nouvelle recherche LinkedIn",
-          formSubtitle:
-            "Saisis un poste, un mot-clé ou une fonction pour obtenir des profils qualifiés.",
-          mainLabel: "Poste / mot-clé / fonction",
-          mainPlaceholder:
-            "Ex. business developer, responsable RH, développeur full stack",
-          buttonLabel: "Lancer la prospection",
-          resultTitle: "Profils trouvés",
-          emptyText: "Aucun profil affiché pour le moment.",
-          helperText:
-            "Résultats avec nom, poste, entreprise et lien direct vers LinkedIn.",
-        }
+        formTitle: "Nouvelle recherche LinkedIn",
+        formSubtitle:
+          "Saisis un poste, un mot-clé ou une fonction pour obtenir des profils qualifiés.",
+        mainLabel: "Poste / mot-clé / fonction",
+        mainPlaceholder:
+          "Ex. business developer, responsable RH, développeur full stack",
+        buttonLabel: "Lancer la prospection",
+        resultTitle: "Profils trouvés",
+        emptyText: "Aucun profil affiché pour le moment.",
+        helperText:
+          "Résultats avec nom, poste, entreprise et lien direct vers LinkedIn.",
+      }
       : {
-          formTitle: "Nouvelle recherche entreprise",
-          formSubtitle:
-            "Saisis un nom, un patronyme ou une société pour retrouver dirigeant, entreprise et SIREN.",
-          mainLabel: "Nom / entreprise / dirigeant",
-          mainPlaceholder: "Ex. Dupont, Jerome BENHAMOU, Martin & Co",
-          buttonLabel: "Rechercher l’entreprise",
-          resultTitle: "Entreprises trouvées",
-          emptyText: "Aucun résultat entreprise affiché pour le moment.",
-          helperText:
-            "Résultats avec nom du dirigeant, entreprise, SIREN et lien source.",
-        };
+        formTitle: "Nouvelle recherche entreprise",
+        formSubtitle:
+          "Saisis un nom, un patronyme ou une société pour retrouver dirigeant, entreprise et SIREN.",
+        mainLabel: "Nom / entreprise / dirigeant",
+        mainPlaceholder: "Ex. Dupont, Jerome BENHAMOU, Martin & Co",
+        buttonLabel: "Rechercher l’entreprise",
+        resultTitle: "Entreprises trouvées",
+        emptyText: "Aucun résultat entreprise affiché pour le moment.",
+        helperText:
+          "Résultats avec nom du dirigeant, entreprise, SIREN et lien source.",
+      };
 
   function resetSharedStates() {
     setResults([]);
@@ -279,9 +279,6 @@ export default function App() {
                 <button className="btn btn-outline" onClick={handleReset}>
                   Réinitialiser
                 </button>
-                <button className="btn btn-outline" onClick={openAdminLogin}>
-                  Dashboard admin
-                </button>
               </div>
 
               <div className="note-card">
@@ -299,9 +296,8 @@ export default function App() {
           {modules.map((module) => (
             <div
               key={module.id}
-              className={`module-card ${
-                mode === module.id ? "module-card-active" : ""
-              }`}
+              className={`module-card ${mode === module.id ? "module-card-active" : ""
+                }`}
               onClick={() => switchMode(module.id)}
             >
               <div className="module-icon">{module.icon}</div>
@@ -619,6 +615,21 @@ export default function App() {
                 </div>
 
                 {adminError && <div className="note-card">{adminError}</div>}
+                <div
+                  onClick={openAdminLogin}
+                  style={{
+                    position: "fixed",
+                    bottom: "10px",
+                    right: "15px",
+                    fontSize: "12px",
+                    opacity: 0.15,
+                    cursor: "pointer",
+                    zIndex: 9999,
+                  }} onMouseEnter={(e) => (e.target.style.opacity = 0.6)}
+                   onMouseLeave={(e) => (e.target.style.opacity = 0.15)}
+                >
+                  ⚙️
+                </div>
 
                 <div className="button-row">
                   <button className="btn btn-light" onClick={handleAdminLogin}>
