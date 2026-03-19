@@ -1,0 +1,36 @@
+{
+  "approved_users": {},
+  "pending_users": {},
+  "blacklist": {},
+  "history": [
+    {
+      "ts": 1773877280,
+      "event": "requested",
+      "user_id": 8799731315,
+      "first_name": "nador",
+      "username": "",
+      "actor_id": null,
+      "meta": {}
+    },
+    {
+      "ts": 1773877283,
+      "event": "granted",
+      "user_id": 8799731315,
+      "first_name": "nador",
+      "username": "",
+      "actor_id": 1770587222,
+      "meta": {
+        "mode": "m5"
+      }
+    },
+    {
+      "ts": 1773877579,
+      "event": "revoked",
+      "user_id": 8799731315,
+      "first_name": "nador",
+      "username": "",
+      "actor_id": 1770587222,
+      "meta": {}
+    }
+  ]
+}

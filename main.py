@@ -7,7 +7,7 @@ import re
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -26,8 +26,16 @@ from telegram.ext import (
     filters,
 )
 
-from config import TOKEN, SERPER_API_KEY, SERPAPI_KEY
-
+from config import (
+    TOKEN,
+    SERPAPI_KEY,
+    PAPPERS_API_KEY,
+    INSEE_CLIENT_ID,
+    INSEE_CLIENT_SECRET,
+    OWNER_USER_ID,
+    ADMIN_USER_IDS,
+    SERPER_API_KEY,
+)
 # --------------------------------------------------
 # BRANDING / UI
 # --------------------------------------------------
@@ -46,9 +54,11 @@ DISPLAY_PAGE_SIZE = 20
 COMPANY_PAGE_SIZE = 5
 SERP_BATCH_SIZE = 10
 MAX_MESSAGE_SAFE = 3800
+MAX_RESULTS_OPTIONS = [20, 50, 100, 200]
 
 EXPORT_DIR = "exports"
 CACHE_FILE = "search_cache.json"
+ACCESS_CONTROL_FILE = "access_control.json"
 REQUEST_TIMEOUT = 20
 
 MAX_COMPANY_STRONG_RESULTS = 5
@@ -60,17 +70,89 @@ CACHE_TTL_PERSON = 43200
 CACHE_TTL_PROSPECT = 43200
 CACHE_TTL_WEB = 86400
 CACHE_TTL_ANNUAIRE = 86400
+CACHE_TTL_NEGATIVE_WEB = 900
+CACHE_TTL_NEGATIVE_SEARCH = 1200
+
+REQUEST_CONNECT_TIMEOUT = 6
+REQUEST_READ_TIMEOUT = 18
+REQUEST_TIMEOUT_TUPLE = (REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT)
+SERPER_MAX_RETRIES = 2
+SERPER_RETRY_DELAYS = [0.8, 1.6]
+SERPAPI_COOLDOWN_SECONDS = 300
+PROVIDER_FAIL_COOLDOWN_SECONDS = 180
+PROVIDER_MAX_CONSECUTIVE_FAILURES = 3
+MAX_PROSPECT_QUERY_VARIANTS = 4
+MAX_COMPANY_QUERY_VARIANTS = 4
+COMPANY_WEB_MAX_WORKERS = 2
+COMPANY_WEB_MAX_ENRICH_CANDIDATES = 8
+COMPANY_WEB_QUERY_BUDGET = 4
+ACCESS_HISTORY_MAX_ITEMS = 500
 
 SEARCH_CACHE: Dict[str, Dict[str, object]] = {}
 PROVIDER_STATS = {
     "cache": 0,
+    "cache_negative": 0,
     "annuaire_api": 0,
     "serper": 0,
     "serpapi": 0,
+    "serpapi_429": 0,
+    "serpapi_cooldown_hits": 0,
+    "provider_skips": 0,
+    "company_query_budget_hits": 0,
+}
+
+PROVIDER_STATE: Dict[str, Dict[str, Any]] = {
+    "serper": {"cooldown_until": 0, "failures": 0, "last_error": ""},
+    "serpapi": {"cooldown_until": 0, "failures": 0, "last_error": ""},
+}
+
+ACCESS_STATE: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "approved_users": {},
+    "pending_users": {},
+    "blacklist": {},
+    "history": [],
 }
 
 ANNUAIRE_API_BASE = "https://recherche-entreprises.api.gouv.fr"
 ANNUAIRE_USER_AGENT = "TelegramProspectBot/2.0"
+def provider_available(provider: str) -> bool:
+    """
+    Vérifie si un provider est disponible (pas en cooldown)
+    """
+    state = PROVIDER_STATE.get(provider)
+    if not state:
+        return True
+
+    cooldown_until = state.get("cooldown_until")
+    if cooldown_until and time.time() < cooldown_until:
+        return False
+
+    return True
+def mark_provider_failure(provider: str, is_429: bool = False):
+    """
+    Marque un provider comme en échec et applique cooldown si nécessaire
+    """
+    state = PROVIDER_STATE.setdefault(provider, {
+        "failures": 0,
+        "cooldown_until": 0
+    })
+
+    state["failures"] += 1
+
+    # Si 429 → cooldown immédiat (5 min)
+    if is_429:
+        state["cooldown_until"] = time.time() + 300  # 5 minutes
+    else:
+        # petit circuit breaker
+        if state["failures"] >= 3:
+            state["cooldown_until"] = time.time() + 120  # 2 minutes
+            state["failures"] = 0
+
+def mark_provider_success(provider: str):
+    state = PROVIDER_STATE.get(provider)
+    if state:
+        state["failures"] = 0
+        state["cooldown_until"] = 0
 
 # --------------------------------------------------
 # LOGGING
@@ -113,17 +195,478 @@ def save_cache() -> None:
         logger.warning("Impossible de sauvegarder le cache disque: %s", e)
 
 
-def get_cache_ttl(cache_key: str) -> int:
+def load_access_state() -> None:
+    global ACCESS_STATE
+    if not os.path.exists(ACCESS_CONTROL_FILE):
+        ACCESS_STATE = {"approved_users": {}, "pending_users": {}, "blacklist": {}, "history": []}
+        return
+
+    try:
+        with open(ACCESS_CONTROL_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+            if isinstance(payload, dict):
+                ACCESS_STATE = {
+                    "approved_users": payload.get("approved_users", {}) or {},
+                    "pending_users": payload.get("pending_users", {}) or {},
+                    "blacklist": payload.get("blacklist", {}) or {},
+                    "history": payload.get("history", []) or [],
+                }
+            else:
+                ACCESS_STATE = {"approved_users": {}, "pending_users": {}, "blacklist": {}, "history": []}
+    except Exception as e:
+        logger.warning("Impossible de charger les accès: %s", e)
+        ACCESS_STATE = {"approved_users": {}, "pending_users": {}, "blacklist": {}, "history": []}
+
+    cleanup_access_state(save=False)
+
+
+def save_access_state() -> None:
+    try:
+        with open(ACCESS_CONTROL_FILE, "w", encoding="utf-8") as f:
+            json.dump(ACCESS_STATE, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("Impossible de sauvegarder les accès: %s", e)
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def user_key(user_id: int) -> str:
+    return str(int(user_id))
+
+
+def user_display_name(first_name: str = "", username: str = "") -> str:
+    if first_name and username:
+        return f"{first_name} (@{username})"
+    if username:
+        return f"@{username}"
+    return first_name or "Utilisateur"
+
+
+def build_user_info(user) -> Dict[str, Any]:
+    return {
+        "user_id": int(user.id),
+        "first_name": getattr(user, "first_name", "") or "",
+        "last_name": getattr(user, "last_name", "") or "",
+        "username": getattr(user, "username", "") or "",
+    }
+
+
+def build_user_profile_link(user_info: Dict[str, Any]) -> str:
+    first_name = html.escape(user_info.get("first_name", "") or "Utilisateur")
+    username = (user_info.get("username") or "").strip()
+    user_id = int(user_info.get("user_id"))
+    if username:
+        return f'<a href="https://t.me/{html.escape(username)}">{first_name}</a> (@{html.escape(username)})'
+    return f'<a href="tg://user?id={user_id}">{first_name}</a>'
+
+
+def access_request_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔓 Demander l'accès", callback_data="access_request")],
+    ])
+
+
+def profile_action_rows(user_info: Dict[str, Any]) -> List[List[InlineKeyboardButton]]:
+    rows: List[List[InlineKeyboardButton]] = []
+    username = (user_info.get("username") or "").strip()
+    if username:
+        rows.append([InlineKeyboardButton("👤 Ouvrir le profil", url=f"https://t.me/{username}")])
+    return rows
+
+
+def access_manage_keyboard(target_user_id: int, pending: bool = True, blacklisted: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("✅ Accès illimité", callback_data=f"access:grant:perm:{target_user_id}")],
+        [
+            InlineKeyboardButton("5 min", callback_data=f"access:grant:m5:{target_user_id}"),
+            InlineKeyboardButton("10 min", callback_data=f"access:grant:m10:{target_user_id}"),
+            InlineKeyboardButton("15 min", callback_data=f"access:grant:m15:{target_user_id}"),
+        ],
+        [
+            InlineKeyboardButton("5 recherches", callback_data=f"access:grant:s5:{target_user_id}"),
+            InlineKeyboardButton("10 recherches", callback_data=f"access:grant:s10:{target_user_id}"),
+            InlineKeyboardButton("25 recherches", callback_data=f"access:grant:s25:{target_user_id}"),
+        ],
+    ]
+    if blacklisted:
+        rows.append([InlineKeyboardButton("♻️ Retirer blacklist", callback_data=f"access:unblacklist:{target_user_id}")])
+    elif pending:
+        rows.append([
+            InlineKeyboardButton("❌ Refuser", callback_data=f"access:deny:{target_user_id}"),
+            InlineKeyboardButton("🚫 Blacklist", callback_data=f"access:blacklist:{target_user_id}"),
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton("🗑️ Supprimer l'accès", callback_data=f"access:revoke:{target_user_id}"),
+            InlineKeyboardButton("🚫 Blacklist", callback_data=f"access:blacklist:{target_user_id}"),
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_access_badge(record: Optional[Dict[str, Any]]) -> str:
+    if not record:
+        return "Aucun accès"
+    expires_at = record.get("expires_at")
+    remaining_searches = record.get("remaining_searches")
+    if expires_at:
+        dt = datetime.fromtimestamp(int(expires_at))
+        return f"Jusqu'au {dt.strftime('%d/%m %H:%M')}"
+    if isinstance(remaining_searches, int):
+        return f"{remaining_searches} recherche(s) restante(s)"
+    return "Accès illimité"
+
+
+def append_access_history(event: str, user_info: Dict[str, Any], actor_id: Optional[int] = None, meta: Optional[Dict[str, Any]] = None) -> None:
+    history = ACCESS_STATE.setdefault("history", [])
+    entry = {
+        "ts": now_ts(),
+        "event": event,
+        "user_id": int(user_info.get("user_id") or 0),
+        "first_name": user_info.get("first_name", "") or "",
+        "username": user_info.get("username", "") or "",
+        "actor_id": int(actor_id) if actor_id else None,
+        "meta": meta or {},
+    }
+    history.append(entry)
+    if len(history) > ACCESS_HISTORY_MAX_ITEMS:
+        del history[:-ACCESS_HISTORY_MAX_ITEMS]
+
+
+def cleanup_access_state(save: bool = True) -> None:
+    approved = ACCESS_STATE.setdefault("approved_users", {})
+    pending = ACCESS_STATE.setdefault("pending_users", {})
+    ACCESS_STATE.setdefault("blacklist", {})
+    history = ACCESS_STATE.setdefault("history", [])
+    changed = False
+    current = now_ts()
+
+    for uid, record in list(approved.items()):
+        expires_at = record.get("expires_at")
+        remaining_searches = record.get("remaining_searches")
+        if expires_at and int(expires_at) <= current:
+            append_access_history("expired", record, meta={"reason": "time"})
+            approved.pop(uid, None)
+            changed = True
+            continue
+        if isinstance(remaining_searches, int) and remaining_searches <= 0:
+            append_access_history("expired", record, meta={"reason": "credits"})
+            approved.pop(uid, None)
+            changed = True
+
+    for uid, record in list(pending.items()):
+        request_at = int(record.get("request_at") or current)
+        if current - request_at > 7 * 86400:
+            pending.pop(uid, None)
+            append_access_history("pending_purged", record)
+            changed = True
+
+    if len(history) > ACCESS_HISTORY_MAX_ITEMS:
+        del history[:-ACCESS_HISTORY_MAX_ITEMS]
+        changed = True
+
+    if changed and save:
+        save_access_state()
+
+
+def get_approved_record(user_id: int) -> Optional[Dict[str, Any]]:
+    cleanup_access_state(save=True)
+    return ACCESS_STATE.get("approved_users", {}).get(user_key(user_id))
+
+
+def get_pending_record(user_id: int) -> Optional[Dict[str, Any]]:
+    cleanup_access_state(save=True)
+    return ACCESS_STATE.get("pending_users", {}).get(user_key(user_id))
+
+
+def get_blacklist_record(user_id: int) -> Optional[Dict[str, Any]]:
+    cleanup_access_state(save=True)
+    return ACCESS_STATE.get("blacklist", {}).get(user_key(user_id))
+
+
+def is_blacklisted(user_id: int) -> bool:
+    return get_blacklist_record(user_id) is not None
+
+
+def has_runtime_access(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    if is_blacklisted(user_id):
+        return False
+    return get_approved_record(user_id) is not None
+
+
+def grant_user_access(user_info: Dict[str, Any], granted_by: int, mode: str) -> Dict[str, Any]:
+    approved = ACCESS_STATE.setdefault("approved_users", {})
+    pending = ACCESS_STATE.setdefault("pending_users", {})
+
+    uid = user_key(user_info["user_id"])
+    record = {
+        "user_id": int(user_info["user_id"]),
+        "first_name": user_info.get("first_name", ""),
+        "last_name": user_info.get("last_name", ""),
+        "username": user_info.get("username", ""),
+        "granted_at": now_ts(),
+        "granted_by": int(granted_by),
+        "expires_at": None,
+        "remaining_searches": None,
+        "mode": mode,
+    }
+
+    if mode.startswith("m") and mode[1:].isdigit():
+        minutes = int(mode[1:])
+        record["expires_at"] = now_ts() + minutes * 60
+    elif mode.startswith("s") and mode[1:].isdigit():
+        record["remaining_searches"] = int(mode[1:])
+
+    approved[uid] = record
+    pending.pop(uid, None)
+    ACCESS_STATE.setdefault("blacklist", {}).pop(uid, None)
+    append_access_history("granted", record, actor_id=granted_by, meta={"mode": mode})
+    save_access_state()
+    return record
+
+
+def deny_user_request(user_id: int, denied_by: Optional[int] = None) -> None:
+    record = ACCESS_STATE.setdefault("pending_users", {}).pop(user_key(user_id), None)
+    if record:
+        append_access_history("denied", record, actor_id=denied_by)
+    save_access_state()
+
+
+def revoke_user_access(user_id: int, revoked_by: Optional[int] = None) -> None:
+    key = user_key(user_id)
+    record = ACCESS_STATE.setdefault("approved_users", {}).pop(key, None) or ACCESS_STATE.setdefault("pending_users", {}).pop(key, None)
+    if record:
+        append_access_history("revoked", record, actor_id=revoked_by)
+    save_access_state()
+
+
+def blacklist_user_access(user_info: Dict[str, Any], blacklisted_by: int, reason: str = "") -> Dict[str, Any]:
+    key = user_key(user_info["user_id"])
+    ACCESS_STATE.setdefault("approved_users", {}).pop(key, None)
+    ACCESS_STATE.setdefault("pending_users", {}).pop(key, None)
+    record = {
+        "user_id": int(user_info["user_id"]),
+        "first_name": user_info.get("first_name", ""),
+        "last_name": user_info.get("last_name", ""),
+        "username": user_info.get("username", ""),
+        "blacklisted_at": now_ts(),
+        "blacklisted_by": int(blacklisted_by),
+        "reason": clean_spaces(reason),
+    }
+    ACCESS_STATE.setdefault("blacklist", {})[key] = record
+    append_access_history("blacklisted", record, actor_id=blacklisted_by, meta={"reason": clean_spaces(reason)})
+    save_access_state()
+    return record
+
+
+def unblacklist_user_access(user_id: int, actor_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    record = ACCESS_STATE.setdefault("blacklist", {}).pop(user_key(user_id), None)
+    if record:
+        append_access_history("unblacklisted", record, actor_id=actor_id)
+        save_access_state()
+    return record
+
+
+def register_pending_request(user_info: Dict[str, Any]) -> bool:
+    if is_blacklisted(int(user_info["user_id"])):
+        return False
+    pending = ACCESS_STATE.setdefault("pending_users", {})
+    key = user_key(user_info["user_id"])
+    if key in pending:
+        return False
+
+    pending[key] = {
+        **user_info,
+        "request_at": now_ts(),
+    }
+    append_access_history("requested", user_info)
+    save_access_state()
+    return True
+
+
+async def notify_user_access_granted(bot, user_id: int, record: Dict[str, Any]) -> None:
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "✅ <b>Accès accordé</b>\n\n"
+                f"Statut : {format_access_badge(record)}\n\n"
+                "Tu peux maintenant utiliser le bot avec /start."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("Impossible de notifier l'utilisateur %s: %s", user_id, e)
+
+
+async def notify_user_access_denied(bot, user_id: int) -> None:
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text="❌ Ta demande d'accès a été refusée.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("Impossible de notifier le refus à %s: %s", user_id, e)
+
+
+async def notify_user_access_revoked(bot, user_id: int) -> None:
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text="⛔ Ton accès au bot a été retiré.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("Impossible de notifier la révocation à %s: %s", user_id, e)
+
+
+async def send_access_request_to_owner(bot, user_info: Dict[str, Any]) -> bool:
+    if not OWNER_USER_ID:
+        return False
+
+    profile_link = build_user_profile_link(user_info)
+    text = (
+        "🔐 <b>Nouvelle demande d'accès</b>\n\n"
+        f"👤 Profil : {profile_link}\n"
+        f"🆔 ID : <code>{user_info['user_id']}</code>\n"
+        f"📝 Nom : {esc(user_display_name(user_info.get('first_name', ''), user_info.get('username', '')))}\n"
+    )
+    rows = []
+    rows.extend(profile_action_rows(user_info))
+    rows.extend(access_manage_keyboard(int(user_info["user_id"]), pending=True).inline_keyboard)
+    try:
+        await bot.send_message(
+            chat_id=OWNER_USER_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+            disable_web_page_preview=True,
+        )
+        return True
+    except Exception as e:
+        logger.warning("Impossible d'envoyer la demande à l'owner: %s", e)
+        return False
+
+
+async def deny_access(update: Update, context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+
+    if is_blacklisted(user.id):
+        text = (
+            "⛔ <b>Accès bloqué</b>\n\n"
+            "Ton accès à ce bot est actuellement bloqué."
+        )
+        markup = None
+    else:
+        pending = get_pending_record(user.id)
+        if pending:
+            text = (
+                "⏳ <b>Demande en attente</b>\n\n"
+                "Ta demande d'accès a déjà été envoyée. J'attends la réponse de l'administrateur."
+            )
+            markup = None
+        else:
+            text = (
+                "🔒 <b>Accès privé</b>\n\n"
+                "Tu n'as pas encore accès à ce bot.\n"
+                "Appuie sur le bouton ci-dessous pour m'envoyer une demande d'accès."
+            )
+            markup = access_request_keyboard()
+
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def require_access(update: Update, context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    if has_runtime_access(user.id):
+        return True
+    await deny_access(update, context)
+    return False
+
+
+def consume_search_credit(user_id: int) -> Optional[Dict[str, Any]]:
+    if is_admin(user_id):
+        return None
+
+    key = user_key(user_id)
+    record = ACCESS_STATE.get("approved_users", {}).get(key)
+    if not record:
+        return None
+
+    remaining_searches = record.get("remaining_searches")
+    if isinstance(remaining_searches, int):
+        remaining_searches -= 1
+        record["remaining_searches"] = remaining_searches
+        if remaining_searches <= 0:
+            ACCESS_STATE["approved_users"].pop(key, None)
+            save_access_state()
+            return {**record, "remaining_searches": 0, "access_revoked": True}
+        save_access_state()
+        return record
+
+    expires_at = record.get("expires_at")
+    if expires_at and int(expires_at) <= now_ts():
+        ACCESS_STATE["approved_users"].pop(key, None)
+        save_access_state()
+        return {**record, "access_revoked": True}
+
+    return record
+
+
+async def after_search_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+
+    record = consume_search_credit(user.id)
+    if not record:
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    if record.get("access_revoked"):
+        await message.reply_text(
+            "⛔ C'était ta dernière recherche autorisée. Ton accès a expiré.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    remaining_searches = record.get("remaining_searches")
+    if isinstance(remaining_searches, int):
+        await message.reply_text(
+            f"ℹ️ Il te reste <b>{remaining_searches}</b> recherche(s).",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+def get_cache_ttl(cache_key: str, cached: Optional[Dict[str, object]] = None) -> int:
+    is_negative = False
+    if cached:
+        data = cached.get("data") if isinstance(cached, dict) else None
+        if isinstance(data, dict):
+            is_negative = bool(data.get("negative_cache"))
+
     if cache_key.startswith("company__"):
-        return CACHE_TTL_COMPANY
+        return CACHE_TTL_NEGATIVE_SEARCH if is_negative else CACHE_TTL_COMPANY
     if cache_key.startswith("annuaire__"):
-        return CACHE_TTL_ANNUAIRE
+        return CACHE_TTL_NEGATIVE_SEARCH if is_negative else CACHE_TTL_ANNUAIRE
     if cache_key.startswith("person__"):
-        return CACHE_TTL_PERSON
+        return CACHE_TTL_NEGATIVE_SEARCH if is_negative else CACHE_TTL_PERSON
     if cache_key.startswith("prospect__"):
-        return CACHE_TTL_PROSPECT
+        return CACHE_TTL_NEGATIVE_SEARCH if is_negative else CACHE_TTL_PROSPECT
     if cache_key.startswith("web__"):
-        return CACHE_TTL_WEB
+        return CACHE_TTL_NEGATIVE_WEB if is_negative else CACHE_TTL_WEB
     return CACHE_TTL_DEFAULT
 
 
@@ -134,11 +677,15 @@ def get_cache_payload(cache_key: str) -> Optional[Dict[str, object]]:
 
     now = time.time()
     ts = float(cached.get("ts", 0))
-    ttl = get_cache_ttl(cache_key)
+    ttl = get_cache_ttl(cache_key, cached)
 
     if now - ts < ttl:
-        PROVIDER_STATS["cache"] += 1
-        return cached.get("data")
+        data = cached.get("data")
+        if isinstance(data, dict) and data.get("negative_cache"):
+            PROVIDER_STATS["cache_negative"] += 1
+        else:
+            PROVIDER_STATS["cache"] += 1
+        return data
 
     return None
 
@@ -164,27 +711,57 @@ def brand_header_text() -> str:
         f"{BOT_BRAND_ACCENT} <i>{esc(BOT_BRAND_SUPPORT)}</i>"
     )
 
-
 def main_menu_text() -> str:
     return (
-        f"<b>Bienvenue sur {esc(BOT_BRAND_NAME)}</b>\n\n"
-        f"Choisis une action pour lancer une recherche :\n"
-        f"• <b>Prospects LinkedIn</b>\n"
-        f"• <b>Recherche personne</b>\n\n"
-        f"Utilise ensuite les filtres pour affiner tes résultats."
+        f"✨ <b>{esc(BOT_BRAND_NAME)}</b>\n"
+        f"<i>{esc(BOT_BRAND_TAGLINE)}</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "🚀 <b>Prospects LinkedIn</b>\n"
+        "<i>Identifie des profils qualifiés à partir de mots-clés avancés.</i>\n\n"
+        "👤 <b>Recherche personne</b>\n"
+        "<i>Retrouve un profil précis rapidement.</i>\n\n"
+        "🏢 <b>Entreprise & dirigeant</b>\n"
+        "<i>Accède aux données clés et aux décideurs.</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚡ <b>Fonctionnalités</b>\n"
+        "• Recherche rapide ou avancée\n"
+        "• Filtres intelligents (pays, niveau, métier)\n"
+        "• Résultats enrichis et scorés\n"
+        "• Export Excel professionnel\n\n"
+        "👇 <b>Sélectionne une option ci-dessous</b>"
     )
 
 
 def prospects_intro_text() -> str:
     return (
         "<b>Module Prospects</b>\n\n"
-        "Envoie un <b>mot-clé</b> à rechercher.\n"
-        "Exemples :\n"
-        "• commercial\n"
-        "• marketing\n"
-        "• recruteur\n"
-        "• data analyst\n\n"
-        "Tu peux aussi coller une <b>offre d’emploi</b> : le bot essaiera de trouver les profils les plus proches."
+        "Choisis ton mode :\n"
+        "• <b>Rapide</b> : tu envoies juste ton besoin.\n"
+        "• <b>Avancé</b> : tu ajoutes des filtres, une zone géographique et plus d’options."
+    )
+
+
+def prospect_query_help_text(mode_variant: str = "quick") -> str:
+    examples = (
+        "<b>Exemples :</b>\n"
+        "• <code>développeur java</code>\n"
+        "• <code>business developer saas</code>\n"
+        "• <code>mission expérience 5 ans développeur react</code>"
+    )
+
+    if mode_variant == "advanced":
+        return (
+            "🎯 <b>Recherche prospects avancée</b>\n\n"
+            "Envoie maintenant ton besoin ou ta description de poste.\n\n"
+            f"{examples}\n\n"
+            "👉 Ensuite, je te proposerai les filtres détaillés."
+        )
+
+    return (
+        "⚡ <b>Recherche prospects rapide</b>\n\n"
+        "Envoie directement ton besoin.\n\n"
+        f"{examples}\n\n"
+        "👉 Je te laisserai ensuite choisir une zone géographique et l’export."
     )
 
 
@@ -197,10 +774,10 @@ def person_intro_text() -> str:
 
 def filters_help_text() -> str:
     return (
-        "<b>Filtres optionnels</b>\n\n"
+        "<b>Filtres avancés</b>\n\n"
         "Format attendu :\n"
         "<code>ville=Paris,pays=France,entreprise=Google,poste=Sales,seniorite=manager</code>\n\n"
-        "Tu peux aussi répondre simplement : <b>aucun</b>"
+        "Tu peux aussi répondre simplement : <b>aucun</b>."
     )
 
 
@@ -209,7 +786,7 @@ def person_filters_help_text() -> str:
         "<b>Filtres optionnels</b>\n\n"
         "Format attendu :\n"
         "<code>ville=Paris,pays=France,entreprise=Airbus</code>\n\n"
-        "Tu peux aussi répondre simplement : <b>aucun</b>"
+        "Tu peux aussi répondre simplement : <b>aucun</b>."
     )
 
 
@@ -222,12 +799,21 @@ def excel_choice_text() -> str:
 
 def loading_search_text(search_mode: str) -> str:
     if search_mode == "person":
-        return "🔎 <b>Recherche LinkedIn en cours…</b>\nMerci de patienter quelques secondes."
-    return "🔎 <b>Recherche prospects en cours…</b>\nPréparation des premiers résultats."
+        return (
+            "🔎 <b>Recherche LinkedIn en cours…</b>\n"
+            "Merci de patienter quelques secondes."
+        )
+    return (
+        "🔎 <b>Recherche prospects en cours…</b>\n"
+        "Préparation des meilleurs profils."
+    )
 
 
 def company_search_loading_text() -> str:
-    return "🏢 <b>Recherche entreprise en cours…</b>\nAnalyse des sources officielles et enrichissement web."
+    return (
+        "🏢 <b>Recherche entreprise en cours…</b>\n"
+        "Analyse des sources officielles et enrichissement web."
+    )
 
 
 def no_result_text() -> str:
@@ -244,6 +830,23 @@ def search_done_text(count: int, mode: str) -> str:
         return f"✅ <b>{count}</b> résultat(s) entreprise trouvé(s), classé(s) par pertinence."
     return f"✅ <b>{count}</b> profil(s) trouvé(s)."
 
+
+def search_summary_text(mode: str, query: str, filters: Dict[str, str], count: int) -> str:
+    filters_txt = ", ".join(f"{k}={v}" for k, v in filters.items()) if filters else "aucun"
+    label = {
+        "prospect": "Prospects LinkedIn",
+        "person": "Recherche personne",
+        "company": "Entreprise / dirigeant",
+    }.get(mode, mode)
+
+    return (
+        "<b>Recherche terminée</b>\n\n"
+        f"• Module : <b>{esc(label)}</b>\n"
+        f"• Requête : <code>{esc(query)}</code>\n"
+        f"• Filtres : <code>{esc(filters_txt)}</code>\n"
+        f"• Résultats : <b>{count}</b>"
+    )
+
 # --------------------------------------------------
 # CLAVIERS
 # --------------------------------------------------
@@ -251,13 +854,71 @@ def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 Prospects LinkedIn", callback_data="menu_prospects")],
         [InlineKeyboardButton("👤 Recherche personne", callback_data="menu_person_menu")],
+        [InlineKeyboardButton("🏢 Entreprise / dirigeant", callback_data="menu_company_direct")],
+        [
+            InlineKeyboardButton("🧠 Aide", callback_data="menu_help"),
+            InlineKeyboardButton("📊 Dernière recherche", callback_data="menu_last"),
+        ],
     ])
+
+
+def back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour menu", callback_data="menu_home")]])
+
+
+def last_search_keyboard(can_relaunch: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if can_relaunch:
+        rows.append([
+            InlineKeyboardButton("🔁 Relancer", callback_data="action_rerun_last"),
+            InlineKeyboardButton("📊 Exporter", callback_data="action_export_last"),
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Retour menu", callback_data="menu_home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def prospects_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Recherche rapide", callback_data="prospect_mode_quick")],
+        [InlineKeyboardButton("🎯 Recherche avancée", callback_data="prospect_mode_advanced")],
+        [InlineKeyboardButton("⬅️ Retour menu", callback_data="menu_home")],
+    ])
+
+
+def prospect_geo_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🇫🇷 France", callback_data="prospect_geo_france"),
+            InlineKeyboardButton("🌍 Maghreb", callback_data="prospect_geo_maghreb"),
+        ],
+        [
+            InlineKeyboardButton("🇪🇺 Europe", callback_data="prospect_geo_europe"),
+            InlineKeyboardButton("🌐 International", callback_data="prospect_geo_international"),
+        ],
+        [InlineKeyboardButton("➖ Aucun filtre", callback_data="prospect_geo_none")],
+        [InlineKeyboardButton("⬅️ Retour menu", callback_data="menu_home")],
+    ])
+
+
+def max_results_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    current = []
+    for value in MAX_RESULTS_OPTIONS:
+        current.append(InlineKeyboardButton(str(value), callback_data=f"max_results:{value}"))
+        if len(current) == 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append([InlineKeyboardButton("⬅️ Retour menu", callback_data="menu_home")])
+    return InlineKeyboardMarkup(rows)
 
 
 def person_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Recherche LinkedIn", callback_data="person_linkedin")],
         [InlineKeyboardButton("🏢 Recherche entreprise", callback_data="person_company")],
+        [InlineKeyboardButton("⬅️ Retour menu", callback_data="menu_home")],
     ])
 
 
@@ -266,7 +927,8 @@ def excel_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("📊 Oui, exporter", callback_data="excel_yes"),
             InlineKeyboardButton("➖ Non", callback_data="excel_no"),
-        ]
+        ],
+        [InlineKeyboardButton("⬅️ Retour menu", callback_data="menu_home")],
     ])
 
 
@@ -275,50 +937,43 @@ def fuzzy_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("✅ Oui", callback_data="fuzzy_yes"),
             InlineKeyboardButton("❌ Non", callback_data="fuzzy_no"),
-        ]
+        ],
+        [InlineKeyboardButton("⬅️ Retour menu", callback_data="menu_home")],
     ])
 
 
 def pagination_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Afficher 20 résultats de plus", callback_data="more")]
+        [InlineKeyboardButton("➕ Afficher 20 résultats de plus", callback_data="more")],
+        [InlineKeyboardButton("📊 Export Excel", callback_data="action_export_last"), InlineKeyboardButton("🏠 Menu", callback_data="menu_home")],
     ])
 
 
 def company_page_keyboard(current_page: int, total_results: int) -> InlineKeyboardMarkup:
     start_index = current_page * COMPANY_PAGE_SIZE
     end_index = min(start_index + COMPANY_PAGE_SIZE, total_results)
-
     rows = []
     detail_buttons = []
-
     for i in range(start_index, end_index):
         local_number = i - start_index + 1
-        detail_buttons.append(
-            InlineKeyboardButton(
-                f"📄 Détails {local_number}",
-                callback_data=f"company_detail_{i}",
-            )
-        )
-
+        detail_buttons.append(InlineKeyboardButton(f"📄 Détails {local_number}", callback_data=f"company_detail_{i}"))
     for i in range(0, len(detail_buttons), 2):
         rows.append(detail_buttons[i:i + 2])
-
     nav_row = []
     if current_page > 0:
         nav_row.append(InlineKeyboardButton("⬅️ Précédents", callback_data="company_prev"))
     if end_index < total_results:
         nav_row.append(InlineKeyboardButton("Suivants ➡️", callback_data="company_next"))
-
     if nav_row:
         rows.append(nav_row)
-
+    rows.append([InlineKeyboardButton("🏠 Menu", callback_data="menu_home")])
     return InlineKeyboardMarkup(rows)
 
 
 def company_detail_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑️ Fermer", callback_data="company_back")]
+        [InlineKeyboardButton("🗑️ Fermer", callback_data="company_back")],
+        [InlineKeyboardButton("🏠 Menu", callback_data="menu_home")],
     ])
 
 # --------------------------------------------------
@@ -375,6 +1030,24 @@ def parse_filters(text: str) -> Dict[str, str]:
             if k and v:
                 result[k] = v
     return result
+
+
+def apply_prospect_geo_filter(filters: Dict[str, str], preset: str) -> Dict[str, str]:
+    updated = dict(filters or {})
+    updated.pop("region_scope", None)
+    if preset and preset != "none":
+        updated["region_scope"] = preset
+    return updated
+
+
+def prospect_geo_label(preset: str) -> str:
+    return {
+        "france": "France",
+        "maghreb": "Maghreb",
+        "europe": "Europe",
+        "international": "International",
+        "none": "Aucun filtre géographique",
+    }.get(preset, "Aucun filtre géographique")
 
 
 def strip_accents(text: str) -> str:
@@ -471,6 +1144,15 @@ async def safe_edit_message_text(
         raise
 
 
+STOPWORDS_CACHE = {"a", "de", "des", "du", "la", "le", "les", "and", "or", "the", "for", "en", "sur", "avec", "dans", "par"}
+
+
+def normalize_cache_phrase(text: str) -> str:
+    normalized = normalize_text(text)
+    tokens = [t for t in normalized.split() if t and t not in STOPWORDS_CACHE]
+    return " ".join(tokens)
+
+
 def make_cache_key(
     search_mode: str,
     base_value: str,
@@ -479,12 +1161,17 @@ def make_cache_key(
     page_size: int,
     fuzzy: bool = False,
 ) -> str:
-    filters_str = "|".join(f"{k}={v}" for k, v in sorted(custom_filters.items()))
-    return f"{search_mode}__{base_value}__{filters_str}__{start}__{page_size}__{fuzzy}"
+    norm_base = normalize_cache_phrase(base_value)
+    filters_str = "|".join(
+        f"{normalize_cache_phrase(str(k))}={normalize_cache_phrase(str(v))}"
+        for k, v in sorted(custom_filters.items())
+        if clean_spaces(str(v))
+    )
+    return f"{search_mode}__{norm_base}__{filters_str}__{start}__{page_size}__{fuzzy}"
 
 
 def make_web_cache_key(query: str, start: int, num: int) -> str:
-    return f"web__{query}__{start}__{num}"
+    return f"web__{normalize_cache_phrase(query)}__{start}__{num}"
 
 
 def parse_company_query_input(text: str) -> Tuple[str, Dict[str, str]]:
@@ -585,29 +1272,47 @@ def search_with_serper(query: str, start: int = 0, num: int = 10) -> Dict[str, o
         "page": page,
     }
 
-    response = requests.post(
-        "https://google.serper.dev/search",
-        headers=headers,
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    organic_results = normalize_organic_results(data.get("organic", []))
-    PROVIDER_STATS["serper"] += 1
-
-    return {
-        "organic_results": organic_results,
-        "has_more": len(organic_results) >= num,
-        "next_start": start + num,
-        "provider": "serper",
-    }
+    last_error = None
+    for attempt in range(SERPER_MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                "https://google.serper.dev/search",
+                headers=headers,
+                json=payload,
+                timeout=REQUEST_TIMEOUT_TUPLE,
+            )
+            response.raise_for_status()
+            data = response.json()
+            organic_results = normalize_organic_results(data.get("organic", []))
+            PROVIDER_STATS["serper"] += 1
+            mark_provider_success("serper")
+            return {
+                "organic_results": organic_results,
+                "has_more": len(organic_results) >= num,
+                "next_start": start + num,
+                "provider": "serper",
+            }
+        except requests.RequestException as e:
+            last_error = e
+            transient = isinstance(e, (requests.Timeout, requests.ConnectionError)) or (getattr(e, "response", None) is not None and getattr(e.response, "status_code", 0) >= 500)
+            if attempt < SERPER_MAX_RETRIES and transient:
+                delay = min(0.3 * (attempt + 1), 1)
+                time.sleep(delay)
+                continue
+            mark_provider_failure("serper", e)
+            raise
+    if last_error:
+        raise last_error
+    raise RuntimeError("Serper indisponible")
 
 
 def search_with_serpapi(query: str, start: int = 0, num: int = 10) -> Dict[str, object]:
     if not SERPAPI_KEY:
         raise RuntimeError("SERPAPI_KEY manquante")
+    if not provider_available("serpapi"):
+        PROVIDER_STATS["serpapi_cooldown_hits"] += 1
+        remaining = provider_cooldown_remaining("serpapi")
+        raise RuntimeError(f"SerpAPI en cooldown ({remaining}s)")
 
     params = {
         "engine": "google",
@@ -623,8 +1328,13 @@ def search_with_serpapi(query: str, start: int = 0, num: int = 10) -> Dict[str, 
     response = requests.get(
         "https://serpapi.com/search.json",
         params=params,
-        timeout=REQUEST_TIMEOUT,
+        timeout=REQUEST_TIMEOUT_TUPLE,
     )
+    if response.status_code == 429:
+        PROVIDER_STATS["serpapi_429"] += 1
+        err = RuntimeError("SerpAPI 429 Too Many Requests")
+        mark_provider_failure("serpapi", err, cooldown_seconds=SERPAPI_COOLDOWN_SECONDS)
+        raise err
     response.raise_for_status()
     data = response.json()
 
@@ -635,6 +1345,7 @@ def search_with_serpapi(query: str, start: int = 0, num: int = 10) -> Dict[str, 
     has_more = bool(next_link or next_page_url)
 
     PROVIDER_STATS["serpapi"] += 1
+    mark_provider_success("serpapi")
 
     return {
         "organic_results": organic_results,
@@ -647,32 +1358,283 @@ def search_web(query: str, start: int = 0, num: int = 10) -> Dict[str, object]:
     cache_key = make_web_cache_key(query, start, num)
     cached = get_cache_payload(cache_key)
     if cached:
+        logger.info("cache_hit provider=web key=%s", cache_key)
         return cached
 
-    # 🔥 TRY SERPER
-    try:
-        result = search_with_serper(query, start=start, num=num)
-        if result.get("organic_results"):
-            set_cache_payload(cache_key, result)
-            return result
-    except Exception as e:
-        logger.warning("Serper failed: %s", e)
+    result = None
 
-    # 🔥 TRY SERPAPI
-    try:
-        result = search_with_serpapi(query, start=start, num=num)
-        if result.get("organic_results"):
-            set_cache_payload(cache_key, result)
-            return result
-    except Exception as e:
-        logger.warning("SerpAPI failed: %s", e)
+    if provider_available("serper"):
+        try:
+            result = search_with_serper(query, start=start, num=num)
+            if result.get("organic_results"):
+                set_cache_payload(cache_key, result)
+                logger.info("search_web provider=serper query=%s results=%s", query, len(result.get("organic_results", [])))
+                return result
+        except Exception as e:
+            logger.warning("Serper failed: %s", e)
+    else:
+        logger.info("Serper skipped due to cooldown")
 
-    # 🔥 FALLBACK
-    return {
+    if provider_available("serpapi"):
+        try:
+            result = search_with_serpapi(query, start=start, num=num)
+            if result.get("organic_results"):
+                set_cache_payload(cache_key, result)
+                logger.info("search_web provider=serpapi query=%s results=%s", query, len(result.get("organic_results", [])))
+                return result
+        except Exception as e:
+            logger.warning("SerpAPI failed: %s", e)
+    else:
+        PROVIDER_STATS["serpapi_cooldown_hits"] += 1
+        logger.info("SerpAPI skipped due to cooldown")
+
+    empty = {
         "organic_results": [],
         "has_more": False,
         "next_start": start + num,
+        "provider": result.get("provider") if isinstance(result, dict) else "none",
+        "negative_cache": True,
     }
+    set_cache_payload(cache_key, empty)
+    return empty
+    
+    
+    
+START_TIME = datetime.now()
+
+
+def is_owner(user_id: int) -> bool:
+    return bool(OWNER_USER_ID and user_id == OWNER_USER_ID)
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+
+async def require_admin(update: Update) -> bool:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        message = update.effective_message
+        if message:
+            await message.reply_text("⛔ Action réservée à l'administrateur.", parse_mode=ParseMode.HTML)
+        return False
+    return True
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+
+    user = update.effective_user
+    uptime = datetime.now() - START_TIME
+    approved = ACCESS_STATE.get("approved_users", {})
+    pending = ACCESS_STATE.get("pending_users", {})
+
+    text = (
+        "🔐 <b>Panneau admin</b>\n\n"
+        f"User ID : <code>{user.id if user else 'inconnu'}</code>\n"
+        f"Owner : {'oui' if user and is_owner(user.id) else 'non'}\n"
+        f"Admins fixes : {len(ADMIN_USER_IDS)}\n"
+        f"Accès actifs : {len(approved)}\n"
+        f"Demandes en attente : {len(pending)}\n"
+        f"Uptime : {str(uptime).split('.')[0]}"
+    )
+
+    if update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=last_search_keyboard(bool(last.get("mode") and last.get("base_value"))))
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+
+    cache_size = 0
+    try:
+        if isinstance(SEARCH_CACHE, dict):
+            cache_size = len(SEARCH_CACHE)
+    except Exception:
+        pass
+
+    text = (
+        "📊 <b>Stats bot</b>\n\n"
+        f"Cache entries : {cache_size}\n"
+        f"Accès actifs : {len(ACCESS_STATE.get('approved_users', {}))}\n"
+        f"Demandes en attente : {len(ACCESS_STATE.get('pending_users', {}))}\n"
+        f"Provider cache : {PROVIDER_STATS.get('cache', 0)}\n"
+        f"Serper : {PROVIDER_STATS.get('serper', 0)}\n"
+        f"SerpAPI : {PROVIDER_STATS.get('serpapi', 0)}"
+    )
+
+    if update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=last_search_keyboard(bool(last.get("mode") and last.get("base_value"))))
+
+
+async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not update.message:
+        return
+
+    approved_record = get_approved_record(user.id)
+    lines = [
+        "👤 <b>Infos Telegram</b>",
+        "",
+        f"ID : <code>{user.id}</code>",
+    ]
+
+    if user.username:
+        lines.append(f"Username : @{user.username}")
+
+    if is_admin(user.id):
+        lines.append("Statut : admin")
+    elif is_blacklisted(user.id):
+        lines.append("Accès : blacklist")
+    elif approved_record:
+        lines.append(f"Accès : {format_access_badge(approved_record)}")
+    else:
+        lines.append("Accès : non autorisé")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cache_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+
+    try:
+        if isinstance(SEARCH_CACHE, dict):
+            SEARCH_CACHE.clear()
+            save_cache()
+        await update.message.reply_text("🧹 Cache vidé.", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors du vidage du cache : <code>{esc(e)}</code>", parse_mode=ParseMode.HTML)
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+
+    approved = list(ACCESS_STATE.get("approved_users", {}).values())
+    if not approved:
+        await update.message.reply_text("Aucun utilisateur avec accès temporaire pour le moment.", parse_mode=ParseMode.HTML)
+        return
+
+    approved.sort(key=lambda x: (x.get("first_name", ""), x.get("username", "")))
+    for record in approved:
+        text = (
+            "👥 <b>Utilisateur autorisé</b>\n\n"
+            f"Nom : {esc(user_display_name(record.get('first_name', ''), record.get('username', '')))}\n"
+            f"ID : <code>{record.get('user_id')}</code>\n"
+            f"Statut : {format_access_badge(record)}"
+        )
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(profile_action_rows(record) + access_manage_keyboard(int(record.get("user_id")), pending=False).inline_keyboard),
+        )
+
+
+async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+
+    pending = list(ACCESS_STATE.get("pending_users", {}).values())
+    if not pending:
+        await update.message.reply_text("Aucune demande en attente.", parse_mode=ParseMode.HTML)
+        return
+
+    pending.sort(key=lambda x: int(x.get("request_at") or 0), reverse=True)
+    for record in pending:
+        text = (
+            "🔐 <b>Demande en attente</b>\n\n"
+            f"Nom : {esc(user_display_name(record.get('first_name', ''), record.get('username', '')))}\n"
+            f"ID : <code>{record.get('user_id')}</code>"
+        )
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(profile_action_rows(record) + access_manage_keyboard(int(record.get("user_id")), pending=True).inline_keyboard),
+        )
+
+
+async def blacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    if not update.message:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage : /blacklist <user_id>", parse_mode=ParseMode.HTML)
+        return
+    try:
+        target_user_id = int(args[0])
+    except Exception:
+        await update.message.reply_text("User ID invalide.", parse_mode=ParseMode.HTML)
+        return
+    target_info = get_pending_record(target_user_id) or get_approved_record(target_user_id) or get_blacklist_record(target_user_id) or {"user_id": target_user_id, "first_name": "Utilisateur", "username": ""}
+    blacklist_user_access(target_info, blacklisted_by=update.effective_user.id)
+    await update.message.reply_text(f"🚫 Utilisateur blacklisté : <code>{target_user_id}</code>", parse_mode=ParseMode.HTML)
+
+
+async def unblacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    if not update.message:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage : /unblacklist <user_id>", parse_mode=ParseMode.HTML)
+        return
+    try:
+        target_user_id = int(args[0])
+    except Exception:
+        await update.message.reply_text("User ID invalide.", parse_mode=ParseMode.HTML)
+        return
+    removed = unblacklist_user_access(target_user_id, actor_id=update.effective_user.id)
+    if not removed:
+        await update.message.reply_text("Aucun utilisateur blacklisté avec cet ID.", parse_mode=ParseMode.HTML)
+        return
+    await update.message.reply_text(f"♻️ Utilisateur retiré de la blacklist : <code>{target_user_id}</code>", parse_mode=ParseMode.HTML)
+
+
+async def blacklist_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    blocked = list(ACCESS_STATE.get("blacklist", {}).values())
+    if not blocked:
+        await update.message.reply_text("Aucune blacklist active.", parse_mode=ParseMode.HTML)
+        return
+    blocked.sort(key=lambda x: int(x.get("blacklisted_at") or 0), reverse=True)
+    for record in blocked:
+        reason = esc(record.get("reason", "") or "-")
+        text = (
+            "🚫 <b>Utilisateur blacklisté</b>\n\n"
+            f"Nom : {esc(user_display_name(record.get('first_name', ''), record.get('username', '')))}\n"
+            f"ID : <code>{record.get('user_id')}</code>\n"
+            f"Raison : {reason}"
+        )
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                profile_action_rows(record) + access_manage_keyboard(int(record.get("user_id")), pending=False, blacklisted=True).inline_keyboard
+            ),
+        )
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    history = list(ACCESS_STATE.get("history", []))[-15:]
+    if not history:
+        await update.message.reply_text("Aucun historique d'accès.", parse_mode=ParseMode.HTML)
+        return
+    lines = ["🕘 <b>Historique accès</b>", ""]
+    for item in reversed(history):
+        dt = datetime.fromtimestamp(int(item.get("ts") or now_ts())).strftime("%d/%m %H:%M")
+        label = user_display_name(item.get("first_name", ""), item.get("username", ""))
+        lines.append(f"• {dt} — <b>{esc(item.get('event', ''))}</b> — {esc(label)} — <code>{item.get('user_id')}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
 # --------------------------------------------------
 # PROSPECTS
 # --------------------------------------------------
@@ -749,16 +1711,17 @@ def build_prospect_query(keyword: str, custom_filters: Dict[str, str]) -> str:
     normalized_keyword = normalize_text(keyword)
 
     aliases = get_keyword_aliases(keyword)
-
-    # 🔥 si plusieurs mots, on construit une requête plus souple
+    
     keyword_tokens = [t for t in normalized_keyword.split() if len(t) >= 2]
 
     if len(aliases) > 1:
-        keyword_part = "(" + " OR ".join(f'"{a}"' for a in aliases) + ")"
+        keyword_part = "(" + " OR ".join(f'"{a}"' for a in aliases[:6]) + ")"
     elif len(keyword_tokens) >= 2:
-        keyword_part = " ".join(f'"{t}"' for t in keyword_tokens[:4])
-    else:
+        keyword_part = " ".join(f'"{t}"' for t in keyword_tokens[:5])
+    elif aliases:
         keyword_part = f'"{aliases[0]}"'
+    else:
+        keyword_part = f'"{keyword}"'
 
     query = (
         f'site:linkedin.com/in {keyword_part} '
@@ -767,12 +1730,13 @@ def build_prospect_query(keyword: str, custom_filters: Dict[str, str]) -> str:
         f'-learning -formation -formations -posts -school -ecole -universite'
     )
 
-    entreprise = custom_filters.get("entreprise")
-    ville = custom_filters.get("ville")
-    pays = custom_filters.get("pays")
-    secteur = custom_filters.get("secteur")
-    poste = custom_filters.get("poste")
-    seniorite = custom_filters.get("seniorite")
+    entreprise = clean_spaces(custom_filters.get("entreprise", ""))
+    ville = clean_spaces(custom_filters.get("ville", ""))
+    pays = clean_spaces(custom_filters.get("pays", ""))
+    secteur = clean_spaces(custom_filters.get("secteur", ""))
+    poste = clean_spaces(custom_filters.get("poste", ""))
+    seniorite = clean_spaces(custom_filters.get("seniorite", ""))
+    region_scope = clean_spaces(custom_filters.get("region_scope", "")).lower()
 
     if poste:
         query += f' "{poste}"'
@@ -787,6 +1751,13 @@ def build_prospect_query(keyword: str, custom_filters: Dict[str, str]) -> str:
     if seniorite:
         query += f' "{seniorite}"'
 
+    if region_scope == "france":
+        query += " (\"France\" OR \"Paris\" OR \"Lyon\" OR \"Lille\" OR \"Marseille\" OR \"Toulouse\" OR \"Nantes\")"
+    elif region_scope == "maghreb":
+        query += " (\"Maroc\" OR \"Morocco\" OR \"Tunisie\" OR \"Tunisia\" OR \"Algérie\" OR \"Algeria\")"
+    elif region_scope == "europe":
+        query += " (\"France\" OR \"Germany\" OR \"Allemagne\" OR \"Spain\" OR \"Espagne\" OR \"Italy\" OR \"Italie\" OR \"Belgium\" OR \"Belgique\" OR \"Netherlands\" OR \"Pays-Bas\")"
+
     return query
 
 def is_job_offer(text: str) -> bool:
@@ -796,58 +1767,110 @@ def is_job_offer(text: str) -> bool:
         "recherche", "poste", "mission", "profil", "experience",
         "responsable", "manager", "recrutons", "offre", "job",
         "role", "position", "cdi", "cdd", "alternance", "stage",
-        "candidat", "entreprise", "client", "competences", "qualification"
+        "candidat", "entreprise", "client", "competences", "qualification",
+        "fullstack", "backend", "frontend", "developpeur", "developer",
+        "react", "node", "python", "java", "data", "sales", "commercial"
     ]
 
     return any(k in text for k in keywords)
 
 
 def extract_job_params(job_text: str) -> Dict[str, Any]:
-    text = normalize_text(job_text)
+    raw_text = clean_spaces(job_text)
+    text = normalize_text(raw_text)
+
+    words = text.split()
+    text = " ".join(words[:50])
 
     job_titles: List[str] = []
     keywords: List[str] = []
     experience_years = 0
-    words = text.split()
-    text = " ".join(words[:30])
+    
 
-    if any(x in text for x in ["sales", "commercial", "business developer", "bizdev"]):
+    if any(x in text for x in ["sales", "commercial", "business developer", "bizdev", "account executive"]):
         job_titles += ["sales manager", "account executive", "business developer", "commercial"]
 
-    if any(x in text for x in ["marketing", "growth"]):
-        job_titles += ["marketing manager", "growth manager"]
+    if any(x in text for x in ["marketing", "growth", "brand", "acquisition"]):
+        job_titles += ["marketing manager", "growth manager", "digital marketing"]
 
-    if any(x in text for x in ["data", "bi"]):
-        job_titles += ["data analyst", "data scientist"]
+    if any(x in text for x in ["data analyst", "bi", "business intelligence"]):
+        job_titles += ["data analyst", "business intelligence"]
 
-    if "saas" in text:
-        keywords.append("saas")
+    if any(x in text for x in ["data scientist", "machine learning", "ml"]):
+        job_titles += ["data scientist"]
 
-    if "b2b" in text:
-        keywords.append("b2b")
+    if any(x in text for x in ["fullstack", "full stack"]):
+        job_titles += ["developpeur fullstack"]
 
-    # 🔥 EXPERIENCE
+    if any(x in text for x in ["backend", "back end", "back-end"]):
+        job_titles += ["developpeur backend"]
+
+    if any(x in text for x in ["frontend", "front end", "front-end"]):
+        job_titles += ["developpeur frontend"]
+
+    if any(x in text for x in ["devops", "kubernetes", "docker", "ci cd", "ci/cd"]):
+        job_titles += ["devops engineer"]
+
+    tech_map = [
+        "react", "node", "nodejs", "python", "java", "spring", "sql",
+        "power bi", "tableau", "aws", "azure", "gcp", "kubernetes",
+        "docker", "fastapi", "django", "salesforce", "hubspot",
+        "excel", "sap", "crm", "saas", "b2b", "devops"
+    ]
+    for tech in tech_map:
+        if normalize_text(tech) in text:
+            keywords.append(tech)
+
     exp_match = re.search(r"(\d+)\s*(ans|years)", text)
     if exp_match:
         experience_years = int(exp_match.group(1))
 
-    city_match = re.search(r"(paris|lyon|marseille|lille)", text)
+    city_match = re.search(
+        r"\b(paris|lyon|marseille|lille|bordeaux|toulouse|nantes|nice|cannes|rennes|strasbourg|montpellier)\b",
+        text
+    )
     city = city_match.group(1) if city_match else ""
 
-    if not job_titles:
-        job_titles = [job_text]
+    seniority = ""
+    if any(x in text for x in ["lead", "principal", "head of"]):
+        seniority = "lead"
+    elif any(x in text for x in ["senior", "confirme", "confirmé", "expert"]):
+        seniority = "senior"
+    elif any(x in text for x in ["junior", "debutant", "débutant"]):
+        seniority = "junior"
+
+    dedup_titles = []
+    seen_titles = set()
+    for t in job_titles:
+        nt = normalize_text(t)
+        if nt and nt not in seen_titles:
+            seen_titles.add(nt)
+            dedup_titles.append(t)
+
+    dedup_keywords = []
+    seen_keywords = set()
+    for k in keywords:
+        nk = normalize_text(k)
+        if nk and nk not in seen_keywords:
+            seen_keywords.add(nk)
+            dedup_keywords.append(k)
+
+    if not dedup_titles:
+        strong_words = [w for w in words if len(w) > 3][:4]
+        dedup_titles = [" ".join(strong_words)] if strong_words else [raw_text]
 
     return {
-        "job_titles": job_titles,
-        "keywords": keywords,
+        "job_titles": dedup_titles[:6],
+        "keywords": dedup_keywords[:6],
         "city": city,
-        "experience": experience_years,  # 🔥 NEW
+        "experience": experience_years,
+        "seniority": seniority,
     }
 
 
 def build_multi_queries(params: Dict[str, Any]) -> List[str]:
     queries = []
-
+    
     for title in params.get("job_titles", []):
         parts = [title]
         parts.extend(params.get("keywords", []))
@@ -856,11 +1879,11 @@ def build_multi_queries(params: Dict[str, Any]) -> List[str]:
         base = clean_spaces(" ".join(parts))
         if base:
             queries.append(base)
-
+            
     if not queries and params.get("job_titles"):
         queries = params["job_titles"][:]
-
-    return list(dict.fromkeys(queries))
+        
+    return list(dict.fromkeys(queries))[:MAX_PROSPECT_QUERY_VARIANTS]
 
 def extract_experience_from_text(text: str) -> int:
     match = re.search(r"(\d+)\s*(ans|years)", text.lower())
@@ -1242,7 +2265,7 @@ def search_company_annuaire(name: str, ville_filter: str = "", max_results: int 
         f"{ANNUAIRE_API_BASE}/search",
         headers=headers,
         params=params,
-        timeout=REQUEST_TIMEOUT,
+        timeout=REQUEST_TIMEOUT_TUPLE,
     )
     response.raise_for_status()
     data = response.json()
@@ -1306,7 +2329,7 @@ def build_company_queries(name: str, ville_filter: str = "") -> List[str]:
                 f'site:societe.com "{last_name}"',
             ])
 
-    return list(dict.fromkeys(base_queries))[:6]
+    return list(dict.fromkeys(base_queries))[:MAX_COMPANY_QUERY_VARIANTS]
 
 
 def is_company_domain(link: str) -> bool:
@@ -1452,11 +2475,13 @@ def search_company_web_query(query: str, name: str, ville_filter: str = "") -> L
 
 
 def search_company_web_enrichment(name: str, ville_filter: str = "") -> List[Dict[str, str]]:
-    queries = build_company_queries(name, ville_filter)
+    queries = build_company_queries(name, ville_filter)[:COMPANY_WEB_QUERY_BUDGET]
+    if len(queries) >= COMPANY_WEB_QUERY_BUDGET:
+        PROVIDER_STATS["company_query_budget_hits"] += 1
     collected: List[Dict[str, str]] = []
     seen_keys = set()
 
-    max_workers = min(4, len(queries)) or 1
+    max_workers = min(COMPANY_WEB_MAX_WORKERS, len(queries)) or 1
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -1483,12 +2508,12 @@ def search_company_web_enrichment(name: str, ville_filter: str = "") -> List[Dic
                 seen_keys.add(key)
                 collected.append(row)
 
-                if len(collected) >= MAX_COMPANY_TOTAL_RESULTS:
+                if len(collected) >= COMPANY_WEB_MAX_ENRICH_CANDIDATES:
                     break
 
             if count_strong_company_results(collected) >= MAX_COMPANY_STRONG_RESULTS:
                 break
-            if len(collected) >= MAX_COMPANY_TOTAL_RESULTS:
+            if len(collected) >= COMPANY_WEB_MAX_ENRICH_CANDIDATES:
                 break
 
     collected.sort(
@@ -1501,7 +2526,7 @@ def search_company_web_enrichment(name: str, ville_filter: str = "") -> List[Dic
         reverse=True,
     )
 
-    return collected[:MAX_COMPANY_TOTAL_RESULTS]
+    return collected[:COMPANY_WEB_MAX_ENRICH_CANDIDATES]
 
 
 def merge_company_sources(primary_rows: List[Dict[str, str]], secondary_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -1535,7 +2560,7 @@ def merge_company_sources(primary_rows: List[Dict[str, str]], secondary_rows: Li
 
 
 def search_company_person(name: str, ville_filter: str = "") -> List[Dict[str, str]]:
-    cache_key = f"company__{normalize_text(name)}__{normalize_text(ville_filter)}"
+    cache_key = f"company__{normalize_cache_phrase(name)}__{normalize_cache_phrase(ville_filter)}"
     cached = get_cache_payload(cache_key)
     if cached:
         return cached.get("results", [])
@@ -1548,6 +2573,15 @@ def search_company_person(name: str, ville_filter: str = "") -> List[Dict[str, s
     except Exception as e:
         logger.warning("Annuaire API indisponible: %s", e)
 
+    annuaire_rows = sorted(
+        annuaire_rows,
+        key=lambda r: (
+            safe_int(r.get("RelevanceScore", 0)),
+            safe_int(r.get("InfoScore", 0)),
+        ),
+        reverse=True,
+    )
+
     if count_strong_company_results(annuaire_rows) < MAX_COMPANY_STRONG_RESULTS:
         try:
             web_rows = search_company_web_enrichment(name, ville_filter)
@@ -1555,7 +2589,7 @@ def search_company_person(name: str, ville_filter: str = "") -> List[Dict[str, s
             logger.warning("Enrichissement web indisponible: %s", e)
 
     final_rows = merge_company_sources(annuaire_rows, web_rows)
-    payload = {"results": final_rows[:MAX_COMPANY_TOTAL_RESULTS]}
+    payload = {"results": final_rows[:MAX_COMPANY_TOTAL_RESULTS], "negative_cache": len(final_rows) == 0}
     set_cache_payload(cache_key, payload)
     return payload["results"]
 
@@ -1615,6 +2649,108 @@ def build_company_page_text(companies: List[Dict[str, str]], current_page: int) 
 # --------------------------------------------------
 # PARSING TITRE GOOGLE
 # --------------------------------------------------
+def extract_years_experience(text: str) -> int:
+    text = normalize_text(text)
+    patterns = [
+        r"(\d+)\s*ans",
+        r"(\d+)\s*years",
+        r"minimum\s*(\d+)",
+        r"at least\s*(\d+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                pass
+    return 0
+
+
+def extract_seniority(text: str) -> str:
+    text = normalize_text(text)
+
+    mapping = {
+        "lead": ["lead", "principal", "head of"],
+        "senior": ["senior", "confirme", "confirmé", "expert"],
+        "mid": ["intermediaire", "intermédiaire", "3 ans", "4 ans", "5 ans"],
+        "junior": ["junior", "debutant", "débutant", "1 an", "2 ans"],
+    }
+
+    for level, keywords in mapping.items():
+        for kw in keywords:
+            if normalize_text(kw) in text:
+                return level
+
+    return ""
+
+
+def extract_technologies(text: str) -> List[str]:
+    text = normalize_text(text)
+
+    techs = [
+        "react", "node", "nodejs", "python", "java", "spring", "sql",
+        "power bi", "tableau", "aws", "azure", "gcp", "kubernetes",
+        "docker", "fastapi", "django", "salesforce", "hubspot",
+        "excel", "sap", "crm", "saas", "b2b", "devops"
+    ]
+
+    found = []
+    for tech in techs:
+        if normalize_text(tech) in text:
+            found.append(tech)
+
+    return list(dict.fromkeys(found))
+
+def smart_extract_search_query(job_text: str) -> Dict[str, Any]:
+    text = normalize_text(job_text)
+    words = text.split()
+    text = " ".join(words[:80])
+
+    job = ""
+    city = ""
+    keywords = extract_technologies(text)
+    experience = extract_years_experience(text)
+    seniority = extract_seniority(text)
+
+    if any(x in text for x in ["fullstack", "full stack"]):
+        job = "developpeur fullstack"
+    elif any(x in text for x in ["backend", "back-end"]):
+        job = "developpeur backend"
+    elif any(x in text for x in ["frontend", "front-end"]):
+        job = "developpeur frontend"
+    elif any(x in text for x in ["data analyst", "bi", "business intelligence"]):
+        job = "data analyst"
+    elif any(x in text for x in ["data scientist"]):
+        job = "data scientist"
+    elif any(x in text for x in ["devops", "sre"]):
+        job = "devops engineer"
+    elif any(x in text for x in ["sales", "commercial", "business developer", "account executive"]):
+        job = "commercial"
+    elif any(x in text for x in ["marketing", "growth"]):
+        job = "marketing manager"
+    elif any(x in text for x in ["rh", "recrutement", "recruiter", "talent acquisition"]):
+        job = "recruiter"
+    else:
+        strong_words = [w for w in words if len(w) > 3][:4]
+        job = " ".join(strong_words) if strong_words else "profil"
+
+    cities = [
+        "paris", "lyon", "lille", "marseille", "bordeaux", "toulouse",
+        "nantes", "nice", "cannes", "rennes", "strasbourg", "montpellier"
+    ]
+    for c in cities:
+        if c in text:
+            city = c
+            break
+
+    return {
+        "job": job,
+        "keywords": keywords[:5],
+        "city": city,
+        "experience": experience,
+        "seniority": seniority,
+    }
 def parse_google_title(title: str) -> Dict[str, str]:
     cleaned = title.replace("| LinkedIn", "").strip()
     parts = [p.strip() for p in cleaned.split(" - ")]
@@ -1778,139 +2914,94 @@ def search_prospect_page(
     start: int = 0,
     page_size: int = SERP_BATCH_SIZE,
 ) -> Dict[str, object]:
-
     custom_filters = custom_filters or {}
-
-    if len(keyword) > 300:
-        keyword = keyword[:300]
+    cache_key = make_cache_key("prospect", keyword, custom_filters, start, page_size, False)
+    cached = get_cache_payload(cache_key)
+    if cached:
+        return cached
 
     raw_keyword = clean_spaces(keyword)
     normalized_keyword = normalize_text(raw_keyword)
+    smart = smart_extract_search_query(raw_keyword)
 
-    # 🔥 mode offre
-    if is_job_offer(raw_keyword):
-        smart = smart_extract_search_query(raw_keyword)
-        base_query = smart["job"]
+    # 🔥 beaucoup plus de variantes
+    queries = list(dict.fromkeys([
+        raw_keyword,
+        smart["job"],
+        f"{smart['job']} {' '.join(smart['keywords'])}" if smart["keywords"] else "",
+        f"{smart['job']} freelance",
+        f"{smart['job']} consultant",
+        f"{smart['job']} developer",
+        f"{smart['job']} engineer",
+        f"{smart['job']} {' '.join(normalized_keyword.split()[:3])}",
+    ]))[:10]
 
-        if smart["keywords"]:
-            base_query += " " + " ".join(smart["keywords"])
-        if smart["city"]:
-            base_query += f" {smart['city']}"
+    queries = [q for q in queries if clean_spaces(q)]
 
-        queries = [base_query]
-
-        # variantes bonus pour mieux matcher
-        if smart["keywords"]:
-            queries.append(f"{smart['job']} {' '.join(smart['keywords'])}")
-        if smart["city"]:
-            queries.append(f"{smart['job']} {smart['city']}")
-
-        params = {
-            "job_titles": [smart["job"]],
-            "keywords": smart["keywords"],
-            "city": smart["city"],
-            "experience": extract_job_params(raw_keyword).get("experience", 0),
-        }
-
-    else:
-        # 🔥 mode mots-clés libres
-        tokens = [t for t in normalized_keyword.split() if len(t) >= 2]
-
-        queries = [raw_keyword]
-
-        # ex: "programmeur fullstack react"
-        if len(tokens) >= 2:
-            queries.append(" ".join(tokens[:2]))
-        if len(tokens) >= 3:
-            queries.append(" ".join(tokens[:3]))
-
-        # variantes ciblées si on détecte une techno / métier
-        smart = smart_extract_search_query(raw_keyword)
-        smart_query = smart["job"]
-        if smart["keywords"]:
-            smart_query += " " + " ".join(smart["keywords"])
-        if smart["city"]:
-            smart_query += f" {smart['city']}"
-
-        if smart_query and normalize_text(smart_query) != normalized_keyword:
-            queries.append(smart_query)
-
-        queries = list(dict.fromkeys([q for q in queries if clean_spaces(q)]))
-
-        params = {
-            "job_titles": [smart.get("job") or raw_keyword],
-            "keywords": smart.get("keywords", []),
-            "city": smart.get("city", ""),
-            "experience": 0,
-        }
-
-    all_results: List[Dict[str, str]] = []
+    all_results = []
     seen_links = set()
 
-    for q in queries[:5]:
-        query = build_prospect_query(q, custom_filters)
-        page = google_search_page(query, custom_filters, start, page_size)
-        organic_results = page["organic_results"]
+    # 🔥 multi pages + multi queries
+    for q in queries:
+        for page_round in range(0, 2):  # 2 pages = ~60 résultats par query
+            query = build_prospect_query(q, custom_filters)
+            page = google_search_page(query, custom_filters, page_round * SERP_BATCH_SIZE, SERP_BATCH_SIZE)
+            print("QUERY:", query)
+            print("RESULTATS GOOGLE:", len(page.get("organic_results", [])))
+            print("RESULTATS GOOGLE:", len(page.get("organic_results", [])))
 
-        for item in organic_results:
-            link = normalize_linkedin_url(item.get("link", ""))
+            for item in page.get("organic_results", []):
+                link = normalize_linkedin_url(item.get("link", ""))
 
-            if not link or "linkedin.com/in/" not in link:
-                continue
-            if link in seen_links:
-                continue
-
-            seen_links.add(link)
-
-            title_data = parse_google_title(item.get("title", ""))
-            snippet = (item.get("snippet", "") or "").strip()
-
-            row = {
-                "Nom": title_data.get("Nom", ""),
-                "Poste": title_data.get("Poste", ""),
-                "Entreprise": title_data.get("Entreprise", ""),
-                "Ville": custom_filters.get("ville", ""),
-                "Pays": custom_filters.get("pays", ""),
-                "Source": "Google / LinkedIn",
-                "Statut": "À contacter",
-                "Priorité": "Moyenne",
-                "Notes": "",
-                "Snippet": snippet,
-                "LinkedIn": link,
-            }
-
-            # 🔥 filtrage intelligent
-            if is_job_offer(raw_keyword):
-                if not row_matches_job_offer(row, params):
+                if not link or "linkedin.com/in/" not in link:
                     continue
-            else:
-                # on accepte soit le match alias classique,
-                # soit un match sur les tokens du texte
-                token_match = False
-                for token in [t for t in normalized_keyword.split() if len(t) >= 3]:
-                    haystack = normalize_text(
-                        f"{row.get('Poste', '')} {row.get('Entreprise', '')} {row.get('Snippet', '')}"
-                    )
-                    if token in haystack:
-                        token_match = True
-                        break
-
-                if not row_matches_keyword(row, raw_keyword) and not token_match:
+                if link in seen_links:
                     continue
 
-            row["MatchScore"] = score_profile_advanced(row, params, custom_filters)
-            all_results.append(row)
+                seen_links.add(link)
 
+                title_data = parse_google_title(item.get("title", ""))
+                snippet = (item.get("snippet", "") or "").strip()
+
+                row = {
+                    "Nom": title_data.get("Nom", ""),
+                    "Poste": title_data.get("Poste", ""),
+                    "Entreprise": title_data.get("Entreprise", ""),
+                    "Ville": custom_filters.get("ville", ""),
+                    "Pays": custom_filters.get("pays", ""),
+                    "Source": "Google / LinkedIn",
+                    "Statut": "À contacter",
+                    "Priorité": "Moyenne",
+                    "Notes": "",
+                    "Snippet": snippet,
+                    "LinkedIn": link,
+                }
+
+                # 🔥 scoring seulement (PLUS DE FILTRE BLOQUANT)
+                row["MatchScore"] = score_profile_advanced(row, {
+                    "job_titles": [smart["job"]],
+                    "keywords": smart["keywords"],
+                    "city": smart["city"],
+                    "experience": smart.get("experience", 0),
+                    "seniority": smart.get("seniority", ""),
+                }, custom_filters)
+
+                all_results.append(row)
+
+    # 🔥 tri uniquement (plus de suppression)
     all_results.sort(key=lambda x: x.get("MatchScore", 0), reverse=True)
 
-    return {
-        "results": all_results[:page_size],
+    payload = {
+        "results": all_results[start:start + page_size],
         "next_start": start + page_size,
-        "has_more": len(all_results) > page_size,
+        "has_more": len(all_results) > (start + page_size),
+        "negative_cache": len(all_results) == 0,
     }
+    set_cache_payload(cache_key, payload)
+    return payload
 # --------------------------------------------------
 # RECHERCHE PERSONNE LINKEDIN
-# --------------------------------------------------
+# -----------------------------------------------
 def search_person_page(
     person_name: str,
     custom_filters: Optional[Dict[str, str]] = None,
@@ -1922,7 +3013,7 @@ def search_person_page(
     cache_key = make_cache_key("person", person_name, custom_filters, start, page_size, fuzzy_enabled)
 
     cached = get_cache_payload(cache_key)
-    if cached:
+    if cached and not cached.get("negative_cache"):
         return cached
 
     query = build_person_query(person_name, custom_filters, fuzzy_enabled)
@@ -2301,6 +3392,12 @@ def reset_user_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["company_results"] = []
     context.user_data["company_page"] = 0
     context.user_data["company_list_message_id"] = None
+    context.user_data.setdefault("last_search_summary", None)
+    context.user_data.setdefault("last_search_export_query", None)
+    context.user_data.setdefault("last_search_mode", None)
+    context.user_data.setdefault("last_search", None)
+    context.user_data["max_results"] = 50
+    context.user_data["prospect_mode_variant"] = "quick"
 
 # --------------------------------------------------
 # ENVOI BRANDING
@@ -2340,22 +3437,27 @@ async def send_brand_welcome(message_obj) -> None:
 # COMMANDES
 # --------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
     reset_user_flow(context)
     if update.message:
         await send_brand_welcome(update.message)
 
 
 async def prospects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
     reset_user_flow(context)
-    context.user_data["flow"] = "awaiting_keyword"
-    context.user_data["search_mode"] = "prospect"
     await update.message.reply_text(
         prospects_intro_text(),
         parse_mode=ParseMode.HTML,
+        reply_markup=prospects_mode_keyboard(),
     )
 
 
 async def person_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
     reset_user_flow(context)
     await update.message.reply_text(
         person_intro_text(),
@@ -2365,6 +3467,8 @@ async def person_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
     reset_user_flow(context)
     await update.message.reply_text(
         "❌ <b>Recherche annulée.</b>\nTu peux relancer avec /start.",
@@ -2373,6 +3477,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
     await update.message.reply_text(
         "<b>Commandes disponibles</b>\n\n"
         "/start\n"
@@ -2397,11 +3503,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if not await require_access(update, context):
+        return
 
     flow = context.user_data.get("flow", "idle")
     text = (update.message.text or "").strip()
 
-    if flow == "awaiting_keyword":
+    if flow in {"awaiting_keyword", "awaiting_keyword_quick", "awaiting_keyword_advanced"}:
         if not text:
             await update.message.reply_text(
                 "Merci d'envoyer un mot-clé valide.",
@@ -2411,22 +3519,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         context.user_data["keyword"] = text
         context.user_data["base_value"] = text
-        context.user_data["flow"] = "awaiting_filters"
-
-        await update.message.reply_text(
-            filters_help_text(),
-            parse_mode=ParseMode.HTML,
-        )
+        mode_variant = context.user_data.get("prospect_mode_variant", "quick")
+        if mode_variant == "advanced" or flow == "awaiting_keyword_advanced":
+            context.user_data["flow"] = "awaiting_filters"
+            await update.message.reply_text(
+                filters_help_text(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_to_menu_keyboard(),
+            )
+        else:
+            context.user_data["filters"] = {}
+            context.user_data["flow"] = "awaiting_prospect_geo"
+            await update.message.reply_text(
+                "<b>Zone géographique</b>\n\nChoisis une préférence pour équilibrer les résultats :",
+                parse_mode=ParseMode.HTML,
+                reply_markup=prospect_geo_keyboard(),
+            )
         return
 
     if flow == "awaiting_filters":
         context.user_data["filters"] = parse_filters(text)
-        context.user_data["flow"] = "awaiting_excel_choice"
+        context.user_data["flow"] = "awaiting_prospect_geo"
 
         await update.message.reply_text(
-            excel_choice_text(),
+            "<b>Zone géographique</b>\n\nChoisis une préférence pour équilibrer les résultats :",
             parse_mode=ParseMode.HTML,
-            reply_markup=excel_keyboard(),
+            reply_markup=prospect_geo_keyboard(),
         )
         return
 
@@ -2453,12 +3571,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if flow == "awaiting_person_filters":
         context.user_data["filters"] = parse_filters(text)
-        context.user_data["flow"] = "awaiting_person_excel_choice"
+        context.user_data["flow"] = "awaiting_person_max_results"
 
         await update.message.reply_text(
-            excel_choice_text(),
+            "Combien de résultats maximum veux-tu récupérer ?",
             parse_mode=ParseMode.HTML,
-            reply_markup=excel_keyboard(),
+            reply_markup=max_results_keyboard(),
         )
         return
 
@@ -2494,10 +3612,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data["company_page"] = 0
         context.user_data["flow"] = "company_results_ready"
 
+        context.user_data["last_search_summary"] = search_summary_text("company", name, {k: v for k, v in company_filters.items() if v}, len(companies))
+        context.user_data["last_search_export_query"] = name
+        context.user_data["last_search_mode"] = "company"
         await update.message.reply_text(
-            search_done_text(len(companies), "company"),
+            context.user_data["last_search_summary"],
             parse_mode=ParseMode.HTML,
         )
+        await after_search_usage(update, context)
 
         page_message = await update.message.reply_text(
             "Chargement des résultats…",
@@ -2571,11 +3693,17 @@ async def launch_search(query, context: ContextTypes.DEFAULT_TYPE, export_excel_
     context.user_data["prefetched_chunk"] = None
     context.user_data["prefetch_task"] = None
     context.user_data["flow"] = "results_ready"
+    context.user_data["last_search_summary"] = search_summary_text(search_mode, base_value, custom_filters, len(first_results))
+    context.user_data["last_search_export_query"] = base_value
+    context.user_data["last_search_mode"] = search_mode
+    context.user_data["last_search"] = {"mode": search_mode, "base_value": base_value, "filters": custom_filters, "fuzzy_enabled": fuzzy_enabled, "summary": context.user_data["last_search_summary"], "count": len(first_results)}
 
     await query.message.reply_text(
-        search_done_text(len(first_results), search_mode),
+        context.user_data["last_search_summary"],
         parse_mode=ParseMode.HTML,
     )
+    fake_update = Update(update_id=0, message=query.message)
+    await after_search_usage(fake_update, context)
     await send_next_page(query.message.chat_id, context)
     start_prefetch(context)
 
@@ -2590,7 +3718,7 @@ async def launch_search(query, context: ContextTypes.DEFAULT_TYPE, export_excel_
                 search_mode,
                 base_value,
                 custom_filters,
-                MAX_RESULTS,
+                int(context.user_data.get("max_results", MAX_RESULTS)),
                 fuzzy_enabled,
             )
             file_path = export_excel(full_results, base_value)
@@ -2607,6 +3735,25 @@ async def launch_search(query, context: ContextTypes.DEFAULT_TYPE, export_excel_
                 parse_mode=ParseMode.HTML,
             )
 
+async def last_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+
+    last = context.user_data.get("last_search")
+
+    if not last:
+        await update.message.reply_text("❌ Aucune recherche récente.")
+        return
+
+    text = (
+        "🕘 <b>Dernière recherche</b>\n\n"
+        f"🔎 Mot-clé : {last.get('keyword', 'N/A')}\n"
+        f"📍 Zone : {last.get('zone', 'N/A')}\n"
+        f"📊 Résultats : {len(last.get('results', []))}\n\n"
+        "👉 Utilise les boutons pour relancer ou modifier."
+    )
+
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=last_search_keyboard(bool(last.get("mode") and last.get("base_value"))))
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -2614,16 +3761,225 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await query.answer()
-    data = query.data
+    data = query.data or ""
     flow = context.user_data.get("flow", "idle")
+
+    if data == "access_request":
+        requester = update.effective_user
+        if not requester:
+            return
+        if has_runtime_access(requester.id):
+            await query.message.reply_text("✅ Tu as déjà accès au bot. Utilise /start.", parse_mode=ParseMode.HTML)
+            return
+
+        user_info = build_user_info(requester)
+        created = register_pending_request(user_info)
+        sent = await send_access_request_to_owner(context.bot, user_info)
+
+        if created and sent:
+            await query.message.reply_text(
+                "⏳ Demande envoyée. Je viens de prévenir l'administrateur en privé.",
+                parse_mode=ParseMode.HTML,
+            )
+        elif get_pending_record(requester.id):
+            await query.message.reply_text(
+                "⏳ Ta demande est déjà en attente.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await query.message.reply_text(
+                "⚠️ Impossible d'envoyer la demande automatiquement pour le moment.",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    if data.startswith("access:"):
+        if not await require_admin(update):
+            return
+
+        parts = data.split(":")
+        if len(parts) < 3:
+            await query.message.reply_text("Action d'accès invalide.", parse_mode=ParseMode.HTML)
+            return
+
+        action = parts[1]
+        mode = parts[2] if len(parts) > 2 else ""
+        try:
+            target_user_id = int(parts[3]) if len(parts) > 3 else int(parts[2])
+        except Exception:
+            await query.message.reply_text("Utilisateur introuvable.", parse_mode=ParseMode.HTML)
+            return
+
+        target_info = get_pending_record(target_user_id) or get_approved_record(target_user_id) or {
+            "user_id": target_user_id,
+            "first_name": "Utilisateur",
+            "username": "",
+        }
+
+        if action == "grant":
+            record = grant_user_access(target_info, update.effective_user.id, mode)
+            await notify_user_access_granted(context.bot, target_user_id, record)
+            await query.message.reply_text(
+                (
+                    "✅ <b>Accès accordé</b>\n\n"
+                    f"Utilisateur : {esc(user_display_name(target_info.get('first_name', ''), target_info.get('username', '')))}\n"
+                    f"ID : <code>{target_user_id}</code>\n"
+                    f"Statut : {format_access_badge(record)}"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=access_manage_keyboard(target_user_id, pending=False),
+            )
+            return
+
+        if action == "deny":
+            deny_user_request(target_user_id, denied_by=update.effective_user.id)
+            await notify_user_access_denied(context.bot, target_user_id)
+            await query.message.reply_text(
+                f"❌ Demande refusée pour <code>{target_user_id}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if action == "revoke":
+            revoke_user_access(target_user_id, revoked_by=update.effective_user.id)
+            await notify_user_access_revoked(context.bot, target_user_id)
+            await query.message.reply_text(
+                f"🗑️ Accès supprimé pour <code>{target_user_id}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if action == "blacklist":
+            record = blacklist_user_access(target_info, blacklisted_by=update.effective_user.id)
+            await notify_user_access_revoked(context.bot, target_user_id)
+            await query.message.reply_text(
+                (
+                    "🚫 <b>Utilisateur blacklisté</b>\n\n"
+                    f"Utilisateur : {esc(user_display_name(target_info.get('first_name', ''), target_info.get('username', '')))}\n"
+                    f"ID : <code>{target_user_id}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(profile_action_rows(record) + access_manage_keyboard(target_user_id, pending=False, blacklisted=True).inline_keyboard),
+            )
+            return
+
+        if action == "unblacklist":
+            unblacklist_user_access(target_user_id, actor_id=update.effective_user.id)
+            await query.message.reply_text(
+                f"♻️ Blacklist retirée pour <code>{target_user_id}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    if data == "menu_home":
+        reset_user_flow(context)
+        await query.message.reply_text(main_menu_text(), parse_mode=ParseMode.HTML, reply_markup=menu_keyboard())
+        return
+
+    if data == "menu_help":
+        if not await require_access(update, context):
+            return
+        await query.message.reply_text(
+            f"<b>{BOT_BRAND_NAME}</b>\n\n"
+            "Choisis un module puis suis les étapes.\n"
+            "Le mode prospects avancé te permet aussi de choisir France, Maghreb, Europe ou aucun filtre.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    if data == "menu_last":
+        if not await require_access(update, context):
+            return
+        summary = context.user_data.get("last_search_summary") or "Aucune recherche récente disponible."
+        await query.message.reply_text(summary, parse_mode=ParseMode.HTML, reply_markup=last_search_keyboard(bool(context.user_data.get("last_search_mode") and context.user_data.get("last_search_export_query"))))
+        return
+
+    if data == "action_rerun_last":
+        if not await require_access(update, context):
+            return
+        last = context.user_data.get("last_search") or {}
+        search_mode = last.get("mode") or context.user_data.get("last_search_mode")
+        base_value = last.get("base_value") or context.user_data.get("last_search_export_query")
+        custom_filters = last.get("filters") or context.user_data.get("filters", {})
+        fuzzy_enabled = bool(last.get("fuzzy_enabled", context.user_data.get("fuzzy_enabled", False)))
+        if not search_mode or not base_value:
+            await query.message.reply_text("Aucune recherche relançable disponible.", parse_mode=ParseMode.HTML)
+            return
+        context.user_data["search_mode"] = search_mode
+        context.user_data["base_value"] = base_value
+        context.user_data["filters"] = custom_filters
+        context.user_data["fuzzy_enabled"] = fuzzy_enabled
+        if search_mode == "company":
+            context.user_data["flow"] = "awaiting_company_query"
+            fake_text = Update(update_id=0, callback_query=query)
+            companies = await asyncio.to_thread(search_company_person, base_value, custom_filters.get("ville", ""))
+            context.user_data["company_results"] = companies
+            context.user_data["company_page"] = 0
+            context.user_data["flow"] = "company_results_ready"
+            await query.message.reply_text(context.user_data.get("last_search_summary") or search_summary_text("company", base_value, custom_filters, len(companies)), parse_mode=ParseMode.HTML)
+            await render_company_page(query.message, context)
+            return
+        context.user_data["flow"] = "results_ready"
+        await launch_search(query, context, False)
+        return
+
+    if data == "action_export_last":
+        if not await require_access(update, context):
+            return
+        search_mode = context.user_data.get("last_search_mode")
+        base_value = context.user_data.get("last_search_export_query")
+        custom_filters = context.user_data.get("filters", {})
+        fuzzy_enabled = bool(context.user_data.get("fuzzy_enabled", False))
+        if not search_mode or not base_value:
+            await query.message.reply_text("Aucune recherche exportable disponible.", parse_mode=ParseMode.HTML)
+            return
+        await query.message.reply_text("📊 <b>Génération de l’Excel complet…</b>", parse_mode=ParseMode.HTML)
+        try:
+            full_results = await asyncio.to_thread(search_full_export, search_mode, base_value, custom_filters, int(context.user_data.get("max_results", MAX_RESULTS)), fuzzy_enabled)
+            file_path = export_excel(full_results, base_value)
+            with open(file_path, "rb") as f:
+                await query.message.reply_document(document=f, filename=os.path.basename(file_path), caption=f"Voici ton export Excel complet ({len(full_results)} profils).")
+        except Exception as e:
+            await query.message.reply_text(f"Impossible de générer l’Excel : <code>{esc(e)}</code>", parse_mode=ParseMode.HTML)
+        return
+
+    if not await require_access(update, context):
+        return
 
     if data == "menu_prospects":
         reset_user_flow(context)
-        context.user_data["flow"] = "awaiting_keyword"
+        await query.message.reply_text(prospects_intro_text(), parse_mode=ParseMode.HTML, reply_markup=prospects_mode_keyboard())
+        return
+
+    if data == "prospect_mode_quick":
+        reset_user_flow(context)
         context.user_data["search_mode"] = "prospect"
+        context.user_data["prospect_mode_variant"] = "quick"
+        context.user_data["flow"] = "awaiting_keyword_quick"
+        await query.message.reply_text(prospect_query_help_text("quick"), parse_mode=ParseMode.HTML, reply_markup=last_search_keyboard(bool(context.user_data.get("last_search_mode") and context.user_data.get("last_search_export_query"))))
+        return
+
+    if data == "prospect_mode_advanced":
+        reset_user_flow(context)
+        context.user_data["search_mode"] = "prospect"
+        context.user_data["prospect_mode_variant"] = "advanced"
+        context.user_data["flow"] = "awaiting_keyword_advanced"
+        await query.message.reply_text(prospect_query_help_text("advanced"), parse_mode=ParseMode.HTML, reply_markup=last_search_keyboard(bool(context.user_data.get("last_search_mode") and context.user_data.get("last_search_export_query"))))
+        return
+
+    if data == "menu_company_direct":
+        reset_user_flow(context)
+        context.user_data["flow"] = "awaiting_company_query"
+        context.user_data["search_mode"] = "company"
         await query.message.reply_text(
-            prospects_intro_text(),
+            "<b>Recherche entreprise</b>\n\n"
+            "Entre un nom ou un nom prénom.\n"
+            "Tu peux ajouter une ville si tu veux.\n\n"
+            "Exemple : <code>Dupont,ville=Paris</code>",
+
             parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
         )
         return
 
@@ -2747,6 +4103,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
+    if data.startswith("prospect_geo_"):
+        if flow != "awaiting_prospect_geo":
+            await query.message.reply_text("Cette action n'est plus valide. Relance avec /prospects.", parse_mode=ParseMode.HTML)
+            return
+        preset = data.replace("prospect_geo_", "")
+        context.user_data["filters"] = apply_prospect_geo_filter(context.user_data.get("filters", {}), preset)
+        context.user_data["flow"] = "awaiting_max_results"
+        await query.message.reply_text(
+            f"<b>Zone sélectionnée</b> : {esc(prospect_geo_label(preset))}\n\n"
+            "Combien de résultats maximum veux-tu récupérer ?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=max_results_keyboard(),
+        )
+        return
+
+    if data.startswith("max_results:"):
+        try:
+            value = int(data.split(":", 1)[1])
+        except Exception:
+            value = 50
+        context.user_data["max_results"] = value
+        if flow == "awaiting_max_results":
+            context.user_data["flow"] = "awaiting_excel_choice"
+        elif flow == "awaiting_person_max_results":
+            context.user_data["flow"] = "awaiting_person_excel_choice"
+        else:
+            await query.message.reply_text("Cette action n'est plus valide. Relance avec /start.", parse_mode=ParseMode.HTML)
+            return
+        await query.message.reply_text(excel_choice_text(), parse_mode=ParseMode.HTML, reply_markup=excel_keyboard())
+        return
+
     if data in {"fuzzy_yes", "fuzzy_no"}:
         if flow != "awaiting_person_fuzzy":
             await query.message.reply_text(
@@ -2761,6 +4148,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.reply_text(
             person_filters_help_text(),
             parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
         )
         return
 
@@ -2801,6 +4189,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # --------------------------------------------------
 def main() -> None:
     load_cache()
+    load_access_state()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -2809,6 +4198,17 @@ def main() -> None:
     app.add_handler(CommandHandler("prospects", prospects))
     app.add_handler(CommandHandler("personne", person_search))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("last", last_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("whoami", whoami_command))
+    app.add_handler(CommandHandler("cache_clear", cache_clear_command))
+    app.add_handler(CommandHandler("users", users_command))
+    app.add_handler(CommandHandler("pending", pending_command))
+    app.add_handler(CommandHandler("blacklist", blacklist_command))
+    app.add_handler(CommandHandler("unblacklist", unblacklist_command))
+    app.add_handler(CommandHandler("blacklisted", blacklist_list_command))
+    app.add_handler(CommandHandler("history", history_command))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -2821,3 +4221,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

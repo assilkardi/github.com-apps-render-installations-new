@@ -1,1 +1,30 @@
-node_modules
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+search_cache.json
+
+# Exports
+exports/
+
+# Mac
+.DS_Store
+__MACOSX/
+
+# Git / local
+.git/
+
+# Front
+node_modules/
+leadgen-app/node_modules/
+leadgen-app/.vercel/
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+exports/
+search_cache.json
+node_modules/
